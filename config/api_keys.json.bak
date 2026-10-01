@@ -12,17 +12,5 @@
     "ui_color": "#00d4ff",
     "plugins_enabled": {
         "manage_file_access": false
-    },
-    "noise_gate": {
-        "enabled": true,
-        "strength": "medium"
-    },
-    "proactive_audio": false,
-    "turn_tuning": {
-        "enabled": true,
-        "silence_ms": 700,
-        "prefix_ms": 200,
-        "start_sensitivity": "low",
-        "end_sensitivity": "high"
     }
 }
