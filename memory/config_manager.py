@@ -382,3 +382,16 @@ def save_plugin_enabled(plugin_name: str, enabled: bool) -> None:
     plugins_cfg[plugin_name] = enabled
     data["plugins_enabled"] = plugins_cfg
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_noise_gate() -> dict:
+    """Microphone noise gate (core/noise_gate.py). On by default: in a quiet room
+    it never closes on speech, and in a noisy one it is what lets the server hear
+    where your sentence ends. Turn off with "noise_gate": {"enabled": false}."""
+    cfg = load_api_keys().get("noise_gate")
+    cfg = cfg if isinstance(cfg, dict) else {}
+    strength = str(cfg.get("strength", "medium")).lower()
+    return {
+        "enabled":  bool(cfg.get("enabled", True)),
+        "strength": strength if strength in ("mild", "medium", "strong") else "medium",
+    }

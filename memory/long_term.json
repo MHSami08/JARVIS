@@ -1,16 +1,6 @@
 {
-  "identity": {
-    "user_identity_context": {
-      "value": "User wants me to remember their identity details shared in chat",
-      "updated": "2026-10-01"
-    }
-  },
-  "preferences": {
-    "image_zoom_percentage": {
-      "value": "125%",
-      "updated": "2026-10-01"
-    }
-  },
+  "identity": {},
+  "preferences": {},
   "projects": {},
   "relationships": {},
   "wishes": {},
