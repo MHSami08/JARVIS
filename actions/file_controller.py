@@ -94,16 +94,58 @@ _SAFE_ROOTS: list[Path] = [
     Path.home(),
 ]
 
+
+def _extra_roots() -> list[Path]:
+    """Folders the user has explicitly granted (config/api_keys.json ->
+    "file_access_roots"). Re-read on every call so a grant made by the
+    manage_file_access plugin takes effect immediately, with no restart."""
+    try:
+        from memory.config_manager import load_api_keys
+        raw = load_api_keys().get("file_access_roots", []) or []
+    except Exception:
+        return []
+    roots: list[Path] = []
+    for r in raw:
+        try:
+            roots.append(Path(str(r)).expanduser())
+        except Exception:
+            continue
+    return roots
+
+
 def _is_safe_path(target: Path) -> bool:
-    """Is the given path inside _SAFE_ROOTS? If not, reject the operation."""
+    """Is the given path inside the home folder or a folder the user granted?
+    If not, reject the operation."""
     try:
         resolved = target.resolve()
-        return any(
-            resolved == root.resolve() or resolved.is_relative_to(root.resolve())
-            for root in _SAFE_ROOTS
-        )
+        for root in list(_SAFE_ROOTS) + _extra_roots():
+            try:
+                r = root.resolve()
+            except Exception:
+                continue
+            if resolved == r or resolved.is_relative_to(r):
+                return True
+        return False
     except Exception:
         return False
+
+
+def _root_aliases() -> dict[str, Path]:
+    """Spoken names for granted folders: "data", "data folder", "d", "d drive",
+    "d:" — so "list my data folder" resolves without a full path."""
+    aliases: dict[str, Path] = {}
+    for root in _extra_roots():
+        names: set[str] = set()
+        if root.name:
+            names.add(root.name.lower())
+            names.add(f"{root.name.lower()} folder")
+        elif root.drive:                       # a drive root such as D:\
+            letter = root.drive.rstrip(":").lower()
+            names.update({root.drive.lower(), letter, f"{letter} drive",
+                          f"{letter}: drive"})
+        for n in names:
+            aliases.setdefault(n, root)
+    return aliases
 
 def _get_desktop() -> Path:
     if _OS == "Linux":
@@ -158,6 +200,8 @@ def _resolve_path(raw: str) -> Path:
         "videos":    _get_videos(),
         "home":      Path.home(),
     }
+    for _alias, _root in _root_aliases().items():
+        shortcuts.setdefault(_alias, _root)
     raw   = raw.strip().strip('"').strip("'")
     lower = raw.lower()
     if lower in shortcuts:
@@ -278,7 +322,8 @@ def delete_file(path: str, name: str = "") -> str:
         # Safe-directory check — protect critical user folders
         protected = {
             _get_desktop(), _get_downloads(), _get_documents(),
-            _get_pictures(), _get_music(), _get_videos(), Path.home()
+            _get_pictures(), _get_music(), _get_videos(), Path.home(),
+            *_extra_roots(),
         }
         if target.resolve() in {p.resolve() for p in protected}:
             return f"Protected directory, cannot delete: {target.name}"
@@ -724,7 +769,7 @@ def file_controller(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
-    "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+    "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage. Works in the home folder and in any extra folder/drive the user granted. If a path is denied, use manage_file_access to ask the user to grant it.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -734,7 +779,7 @@ TOOL = {
             },
             "path": {
                 "type": "STRING",
-                "description": "File/folder path or shortcut: desktop, downloads, documents, home"
+                "description": "File/folder path or shortcut: desktop, downloads, documents, home, or the name of a folder/drive the user has granted via manage_file_access (e.g. data, d drive). Full paths like D:\\Data\\notes.txt also work inside granted folders."
             },
             "destination": {
                 "type": "STRING",
