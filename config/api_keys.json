@@ -1,0 +1,13 @@
+{
+    "gemini_api_key": "AQ.Ab8RN6Kiha7RlXEm4_CgYgkDYcqIL3zt4o2ScYDGWEmWlQoj3w",
+    "os_system": "windows",
+    "input_device": "Microphone (Realtek(R) Audio)",
+    "output_device": "Speakers (Realtek(R) Audio)",
+    "morning_brief_enabled": false,
+    "hud_style": "core",
+    "wake_word_enabled": false,
+    "push_to_talk_enabled": false,
+    "assistant_name": "JARVIS",
+    "user_name": "MH",
+    "ui_color": "#00d4ff"
+}
