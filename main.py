@@ -72,6 +72,7 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_noise_gate,
 )
 from core                     import gemini as _gemini
 from core.plugin_loader        import discover_plugins
@@ -80,6 +81,7 @@ from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
+from core.noise_gate           import NoiseGate
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -562,6 +564,8 @@ class JarvisLive:
         self._ptt                  = None    # core.hotkey.PushToTalk
         self._out_level            = 0.0     # level of the audio being played right now
         self._echo                 = EchoGuard()
+        _ng = get_noise_gate()
+        self._noise_gate           = NoiseGate(_ng["strength"]) if _ng["enabled"] else None
         # `stream.write()` returns when the buffer accepts the audio, not when the
         # speaker has finished with it, so sound is still in the room after the
         # speaking flag drops. Streaming the microphone during that gap is how an
@@ -1371,7 +1375,15 @@ class JarvisLive:
                 return
             
             if not self.ui.muted and not self._phone_active:
-                data = indata.tobytes()
+                # Room noise is replaced with silence so the server's speech
+                # detector hears a clean gap where you stopped talking.
+                block = indata
+                if self._noise_gate is not None:
+                    try:
+                        block = self._noise_gate.process(indata)
+                    except Exception:
+                        block = indata
+                data = block.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
@@ -1380,7 +1392,7 @@ class JarvisLive:
                 # the user's actual voice while listening. Purely cosmetic — any
                 # failure here must never disturb the mic.
                 try:
-                    self.ui.set_audio_level(_pcm_level(indata))
+                    self.ui.set_audio_level(_pcm_level(block))
                 except Exception:
                     pass
 
