@@ -461,7 +461,7 @@ TOOL_DECLARATIONS = [
                     )
                 },
                 "key":   {"type": "STRING", "description": "Short snake_case key (e.g. name, favorite_food, sister_name)"},
-                "value": {"type": "STRING", "description": "Concise value in English (e.g. Fatih, pizza, older sister)"},
+                "value": {"type": "STRING", "description": "Concise value in English (e.g. Sam, pizza, older sister)"},
             },
             "required": ["category", "key", "value"]
         }
@@ -2380,5 +2380,43 @@ def main():
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
 
+_INSTANCE_LOCK = None      # held for the life of the process
+
+
+def _single_instance_or_exit() -> None:
+    """Refuse to start a second copy of JARVIS.
+
+    config/jarvis.log showed two copies starting in the same second (the desktop
+    shortcut and auto-start): both connected to Gemini, both opened the mic, and
+    the second could not bind port 8000, so the phone reached the wrong copy and
+    said "Link Expired". The OS frees this lock by itself if JARVIS crashes.
+    Set JARVIS_ALLOW_MULTIPLE=1 to run two on purpose (e.g. while developing).
+    """
+    global _INSTANCE_LOCK
+    import os
+    if os.environ.get("JARVIS_ALLOW_MULTIPLE") == "1":
+        return
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    try:
+        s.bind(("127.0.0.1", 47831))
+        s.listen(1)
+    except OSError:
+        msg = ("JARVIS is already running.\n\nLook for it in the taskbar or the system tray. "
+               "Only one copy can run at a time.")
+        print("[JARVIS] " + msg.replace("\n", " "))
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, msg, "J.A.R.V.I.S", 0x40)
+            except Exception:
+                pass
+        sys.exit(0)
+    _INSTANCE_LOCK = s
+
+
 if __name__ == "__main__":
+    _single_instance_or_exit()
     main()
