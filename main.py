@@ -34,6 +34,27 @@ for _stream in ("stdout", "stderr"):
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+# pythonw.exe (what the desktop shortcut and auto-start use) has NO console, so
+# sys.stdout / sys.stderr are None. Libraries that assume a console then crash
+# (uvicorn did: "Unable to configure formatter"), and every print() / traceback
+# vanishes, which is why a problem could never be seen. Give them a log file.
+if _sys.stdout is None or _sys.stderr is None:
+    try:
+        from pathlib import Path as _Path
+        _cfg_dir = _Path(__file__).resolve().parent / "config"
+        _cfg_dir.mkdir(parents=True, exist_ok=True)
+        _log_path = _cfg_dir / "jarvis.log"
+        if _log_path.exists() and _log_path.stat().st_size > 2_000_000:
+            _log_path.replace(_cfg_dir / "jarvis.old.log")
+        _log_fh = open(_log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+        _log_fh.write("\n==== JARVIS started (no console) ====\n")
+        if _sys.stdout is None:
+            _sys.stdout = _log_fh
+        if _sys.stderr is None:
+            _sys.stderr = _log_fh
+    except Exception:
+        pass
+
 import asyncio
 import re
 import threading
@@ -548,6 +569,7 @@ class JarvisLive:
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
+        self._phone_last          = 0.0     # monotonic time of the last phone audio chunk
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
         self._vision_cam_active    = False   # True if camera was opened for vision → auto-close after response
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
@@ -833,6 +855,18 @@ class JarvisLive:
             self.ui.write_log(
                 "SYS: Dashboard unavailable. "
                 "Run: pip install fastapi \"uvicorn[standard]\" cryptography"
+            )
+            return None
+        if getattr(self._dashboard, "port_conflict", False):
+            self.ui.write_log(
+                "ERR: Port 8000 is already used - JARVIS is probably open twice "
+                "(VS Code + desktop shortcut). Close the other one, then press Remote Control again."
+            )
+            return None
+        if not getattr(self._dashboard, "ready", True):
+            self.ui.write_log(
+                "ERR: The phone dashboard is not running. Details: config/jarvis.log "
+                "(or the console)."
             )
             return None
         key    = self._dashboard.new_key()
@@ -1324,7 +1358,8 @@ class JarvisLive:
             # is off (default) or we're awake, this is a single boolean check.
             if self._wake_enabled and not self._awake:
                 det = self._wake_detector
-                if det is not None:
+                # Phone is the microphone: the PC mic must not wake JARVIS either.
+                if det is not None and not self._phone_blocks_pc_mic():
                     det.feed(indata)
                 return
             with self._speaking_lock:
@@ -1374,7 +1409,7 @@ class JarvisLive:
             if self._ptt_enabled and not self._ptt_held:
                 return
             
-            if not self.ui.muted and not self._phone_active:
+            if not self.ui.muted and not self._phone_blocks_pc_mic():
                 # Room noise is replaced with silence so the server's speech
                 # detector hears a clean gap where you stopped talking.
                 block = indata
@@ -2020,6 +2055,7 @@ class JarvisLive:
                 self._phone_active = False
                 continue
             self._phone_active = True   # phone is streaming — silence PC mic
+            self._phone_last = time.monotonic()
             with self._speaking_lock:
                 speaking = self._is_speaking
             if not speaking and not self.ui.muted:
@@ -2027,6 +2063,20 @@ class JarvisLive:
                     self.out_queue.put_nowait(chunk)
                 except asyncio.QueueFull:
                     pass
+
+    def _phone_blocks_pc_mic(self) -> bool:
+        """True while the PHONE is the microphone, so the PC mic sends nothing.
+
+        Two sources hearing at once confuse the model, and a cough or a keyboard
+        next to the PC could "speak" for you. The old check only looked at whether
+        phone audio had arrived in the last second, so every pause in speech
+        handed the PC mic back. Now it stays shut for as long as the phone's
+        microphone connection is OPEN, plus a short hold after it closes.
+        """
+        d = self._dashboard
+        if d is not None and getattr(d, "phone_mic_open", 0) > 0:
+            return True
+        return self._phone_active or (time.monotonic() - self._phone_last) < 1.5
 
     def _on_phone_connected(self) -> None:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
