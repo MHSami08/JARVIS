@@ -55,6 +55,14 @@ def _get_os() -> str:
 
 
 def _get_api_key() -> str:
+    # Ask the shared key ladder first so this follows the fallback order.
+    try:
+        from core import gemini
+        k = gemini.api_key()
+        if k:
+            return k
+    except Exception:
+        pass
     return _load_config().get("gemini_api_key", "")
 
 _SAFE_SCREENSHOT_ROOTS = (
@@ -311,33 +319,41 @@ def _focus_window(title: str) -> str:
     return f"focus_window: unknown OS '{os_name}'"
 
 def _screen_find(description: str) -> tuple[int, int] | None:
-    api_key = _get_api_key()
-    if not api_key:
+    """Ask Gemini for a normalized 0-1000 box (its native grounding format),
+    then convert to real screen pixels. Raw-pixel answers are unreliable."""
+    if not _get_api_key():
         print("[ComputerControl] ⚠️ No API key for screen_find")
         return None
 
     try:
-        from google import genai
         from google.genai import types as gtypes
 
         _require_pyautogui()
-        w, h  = pyautogui.size()
-        img   = pyautogui.screenshot()
-        buf   = io.BytesIO()
-        img.save(buf, format="PNG")
+        sw, sh = pyautogui.size()
+        img    = pyautogui.screenshot()
+        # Normalized coords don't care about resolution, so shrink the upload:
+        # a 4K PNG is slow and expensive for no gain in accuracy.
+        if img.width > 1600:
+            img = img.resize((1600, round(img.height * 1600 / img.width)))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=85)
         image_bytes = buf.getvalue()
 
         prompt = (
-            f"This is a screenshot of a {w}×{h} pixel screen. "
             f"Locate the UI element described as: '{description}'. "
-            f"Reply with ONLY the center coordinates as: x,y "
-            f"If the element is not visible, reply: NOT_FOUND"
+            "Reply with ONLY a JSON object: {\"box_2d\": [ymin, xmin, ymax, xmax]} "
+            "with coordinates normalized to 0-1000 "
+            "(0,0 = top-left of the screenshot, 1000,1000 = bottom-right). "
+            "If the element is not visible, reply exactly: NOT_FOUND"
         )
 
         from core import gemini
+        # An explicit model name as `tier` is tried FIRST (see gemini.call). The
+        # default FAST ladder leads with a Live voice model, which is the wrong
+        # tool for pointing at pixels; gemini-2.5-flash is good at boxes.
         response = gemini.call(
-            [gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"), prompt],
-            tier=gemini.FAST, timeout_ms=20_000,
+            [gtypes.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"), prompt],
+            tier="gemini-2.5-flash", timeout_ms=20_000,
         )
         if response is None:
             return None
@@ -346,9 +362,14 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         if "NOT_FOUND" in text.upper():
             return None
 
-        match = re.search(r"(\d+)\s*,\s*(\d+)", text)
-        if match:
-            return int(match.group(1)), int(match.group(2))
+        m = re.search(
+            r"\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,"
+            r"\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]", text)
+        if m:
+            ymin, xmin, ymax, xmax = (float(g) for g in m.groups())
+            x = int((xmin + xmax) / 2000 * sw)
+            y = int((ymin + ymax) / 2000 * sh)
+            return max(0, min(sw - 1, x)), max(0, min(sh - 1, y))
 
     except Exception as e:
         print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
