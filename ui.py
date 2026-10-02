@@ -34,7 +34,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap, QRadialGradient, QShortcut,
+    QPen, QPixmap, QRadialGradient, QShortcut, QTextBlockFormat,
 )
 # Video playback for the HUD. Part of PyQt6, so it costs no new dependency —
 # but the multimedia plugins are a separate piece of the Qt install and can be
@@ -55,6 +55,12 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
+
+# Readable fonts / neutral text colour (core/ui_readability.py). Rebinding QFont here
+# is what swaps Courier New for a clean UI font everywhere below.
+from core import ui_readability as _ur
+QFont = _ur.QFont
+_READABLE = _ur.enabled()
 
 try:
     from core.avatar import HoloAvatar
@@ -117,13 +123,27 @@ class C:
     BAR_BG    = "#011520"
 
 
+if _READABLE:
+    # Calmer, less saturated surfaces; neutral (not blue) text. PRI/PRI_DIM stay
+    # the accent colour, used for borders, buttons, rings and the waveform.
+    C.BG, C.PANEL, C.PANEL2 = "#0a0e13", "#10161d", "#131a22"
+    C.BORDER, C.BORDER_B, C.BORDER_A = "#223040", "#34506a", "#2a4258"
+    C.DARK, C.BAR_BG = "#070a0e", "#121a22"
+    C.TEXT, C.TEXT_MED, C.TEXT_DIM, C.WHITE = (
+        _ur.TEXT_PRIMARY, _ur.TEXT_SECONDARY, _ur.TEXT_MUTED, "#ffffff")
+
 # Keys tied to the accent colour — status colours (ACC, GREEN, RED…) stay fixed
 _HUE_LINKED = (
     "BG", "PANEL", "PANEL2", "BORDER", "BORDER_B", "BORDER_A",
     "PRI", "PRI_DIM", "PRI_GHO", "TEXT", "TEXT_DIM", "TEXT_MED",
     "WHITE", "DARK", "BAR_BG",
 )
+if _READABLE:
+    # Text stays neutral whatever accent the user picks, so it is never re-tinted.
+    _HUE_LINKED = tuple(k for k in _HUE_LINKED
+                        if k not in ("TEXT", "TEXT_DIM", "TEXT_MED", "WHITE"))
 _PALETTE_DEFAULTS: dict[str, str] = {k: getattr(C, k) for k in _HUE_LINKED}
+_ur.install(lambda: (C.PRI, C.PRI_DIM, C.BORDER, C.BORDER_B, C.BORDER_A))
 
 DEFAULT_UI_COLOR = _PALETTE_DEFAULTS["PRI"]
 
@@ -1011,7 +1031,7 @@ class LogWidget(QTextEdit):
         # without bound — keeps memory flat and every insert cheap. Oldest
         # lines drop off the top automatically.
         self.document().setMaximumBlockCount(600)
-        self.setFont(QFont("Courier New", 9))
+        self.setFont(QFont("Courier New", 11 if _READABLE else 9))
         self.setStyleSheet(f"""
             QTextEdit {{
                 background: {C.PANEL};
@@ -1023,13 +1043,19 @@ class LogWidget(QTextEdit):
             }}
             QScrollBar:vertical {{
                 background: {C.BG};
-                width: 8px;
+                width: 10px;
                 border: none;
             }}
             QScrollBar::handle:vertical {{
                 background: {C.BORDER_B};
-                border-radius: 4px;
-                min-height: 20px;
+                border-radius: 5px;
+                min-height: 28px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px; border: none; background: none;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: none;
             }}
         """)
         self._queue: list[str] = []
@@ -1070,19 +1096,38 @@ class LogWidget(QTextEdit):
         if self._pos < len(self._text):
             ch  = self._text[self._pos]
             cur = self.textCursor()
+            if self._pos == 0 and _READABLE:
+                # Roomier lines, a little air between messages.
+                cur.movePosition(cur.MoveOperation.End)
+                bf = QTextBlockFormat()
+                bf.setLineHeight(135.0, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+                bf.setBottomMargin(7)
+                cur.mergeBlockFormat(bf)
             fmt = cur.charFormat()
-            col = {
-                "you":  qcol(C.WHITE),
-                "ai":   qcol(C.PRI),
-                "err":  qcol(C.RED),
-                "file": qcol(C.GREEN),
-                # SYS lines are the bulk of the log. Amber fought the cyan HUD
-                # and, being a fixed status colour rather than a hue-linked one,
-                # stayed amber even after the accent picker retinted everything
-                # else. TEXT_MED follows the theme and drops the contrast to a
-                # level you can read past.
-                "sys":  qcol(C.TEXT_MED),
-            }.get(self._tag, qcol(C.TEXT))
+            if _READABLE:
+                # "You:" / "Jarvis:" is a bold label; the message itself is plain
+                # light text, so the speaker is clear without colouring everything.
+                colon = self._text.find(":")
+                label = self._tag in ("you", "ai") and 0 <= colon < 24 and self._pos <= colon
+                if self._tag == "you":
+                    col = qcol(C.TEXT_MED if label else C.WHITE)
+                elif self._tag == "ai":
+                    col = qcol(C.PRI if label else C.TEXT)
+                elif self._tag == "err":
+                    col = qcol("#ff8a9b")
+                elif self._tag == "file":
+                    col = qcol("#5ee6a8")
+                else:
+                    col = qcol(C.TEXT_DIM)
+                fmt.setFontWeight(QFont.Weight.Bold.value if label else QFont.Weight.Normal.value)
+            else:
+                col = {
+                    "you":  qcol(C.WHITE),
+                    "ai":   qcol(C.PRI),
+                    "err":  qcol(C.RED),
+                    "file": qcol(C.GREEN),
+                    "sys":  qcol(C.TEXT_MED),
+                }.get(self._tag, qcol(C.TEXT))
             fmt.setForeground(QBrush(col))
             cur.movePosition(cur.MoveOperation.End)
             cur.insertText(ch, fmt)
@@ -1138,7 +1183,7 @@ class FileDropZone(QWidget):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(100)
+        self.setFixedHeight(50)
         self._current_file: str | None = None
         self._hovering  = False
         self._drag_over = False
@@ -1193,6 +1238,7 @@ class FileDropZone(QWidget):
         return self._current_file
 
     def clear_file(self):
+        self.setFixedHeight(50)
         self._current_file = None; self._canvas.update()
 
     def _browse(self):
@@ -1211,6 +1257,7 @@ class FileDropZone(QWidget):
             self._set_file(path)
 
     def _set_file(self, path: str):
+        self.setFixedHeight(84)
         self._current_file = path
         self._canvas.update()
         self.file_selected.emit(path)
@@ -1254,18 +1301,16 @@ class _DropCanvas(QWidget):
     def _paint_idle(self, p, W, H, hover):
         cx, cy = W / 2, H / 2
         col = qcol(C.PRI_DIM if not hover else C.PRI)
-        p.setPen(QPen(col, 2)); p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawLine(QPointF(cx, cy - 14), QPointF(cx, cy + 4))
-        p.drawLine(QPointF(cx - 8, cy - 6), QPointF(cx, cy - 14))
-        p.drawLine(QPointF(cx + 8, cy - 6), QPointF(cx, cy - 14))
-        p.drawLine(QPointF(cx - 14, cy + 4), QPointF(cx + 14, cy + 4))
+        p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
+        
+        # Compact single-line prompt
         p.setFont(QFont("Courier New", 8))
         p.setPen(QPen(qcol(C.PRI_DIM if not hover else C.TEXT), 1))
-        p.drawText(QRectF(0, cy + 8, W, 16), Qt.AlignmentFlag.AlignCenter,
-                   "Drop file here  or  Click to Browse")
+        p.drawText(QRectF(0, 0, W, H), Qt.AlignmentFlag.AlignCenter,
+                   "📂  Drop file here  ·  Click to Browse")
         p.setFont(QFont("Courier New", 7))
-        p.setPen(QPen(qcol("#1a4a5a"), 1))
-        p.drawText(QRectF(0, cy + 24, W, 14), Qt.AlignmentFlag.AlignCenter,
+        p.setPen(QPen(qcol(C.TEXT_DIM if _READABLE else "#1a4a5a"), 1))
+        p.drawText(QRectF(0, cy + 28, W, 18), Qt.AlignmentFlag.AlignCenter,
                    "Images · Video · Audio · PDF · Docs · Code · Data")
 
     def _paint_drag_over(self, p, W, H):
@@ -1295,20 +1340,20 @@ class _DropCanvas(QWidget):
         p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         p.setPen(QPen(qcol(C.WHITE), 1))
         name = path.name if len(path.name) <= 34 else path.name[:31] + "..."
-        p.drawText(QRectF(tx, H * 0.18, tw, 16),
+        p.drawText(QRectF(tx, H * 0.12, tw, 18),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
 
         p.setFont(QFont("Courier New", 7))
         p.setPen(QPen(qcol(C.TEXT_DIM), 1))
-        p.drawText(QRectF(tx, H * 0.18 + 18, tw, 14),
+        p.drawText(QRectF(tx, H * 0.12 + 20, tw, 16),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                    f"{ext_str}  ·  {size_str}")
 
         p.setFont(QFont("Courier New", 6))
-        p.setPen(QPen(qcol("#1e5c6a"), 1))
+        p.setPen(QPen(qcol(C.TEXT_DIM if _READABLE else "#1e5c6a"), 1))
         par = str(path.parent)
         if len(par) > 42: par = "…" + par[-41:]
-        p.drawText(QRectF(tx, H * 0.18 + 34, tw, 12),
+        p.drawText(QRectF(tx, H * 0.12 + 38, tw, 14),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, par)
 
         p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
@@ -2786,7 +2831,7 @@ class RemoteKeyOverlay(QWidget):
         lay.addWidget(self._url_lbl)
 
         self._key_lbl = QLabel(key)
-        self._key_lbl.setFont(QFont("Courier New", 28, QFont.Weight.Bold))
+        self._key_lbl.setFont(QFont(_ur.MONO_FONT if _READABLE else "Courier New", 28, QFont.Weight.Bold))
         self._key_lbl.setStyleSheet(f"""
             color: {C.ACC};
             background: {C.PANEL2};
@@ -4134,14 +4179,19 @@ class MainWindow(QMainWindow):
         self._interrupt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._interrupt_btn.setStyleSheet(f"""
             QPushButton {{
-                background: #140008; color: {C.MUTED_C};
-                border: 1px solid {C.MUTED_C}; border-radius: 3px;
+                background: rgba(255, 51, 85, 0.08);
+                color: {C.MUTED_C};
+                border: 1px solid rgba(255, 51, 85, 0.35);
+                border-radius: 4px;
+                letter-spacing: 1px;
             }}
             QPushButton:hover {{
-                background: #200010; border: 1px solid #ff6688;
+                background: rgba(255, 51, 85, 0.22);
+                border: 1px solid {C.MUTED_C};
+                color: #ffffff;
             }}
             QPushButton:pressed {{
-                background: #300018;
+                background: rgba(255, 51, 85, 0.35);
             }}
         """)
         self._interrupt_btn.clicked.connect(self._do_interrupt)
@@ -4894,7 +4944,6 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
         lay.addStretch()
-        lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
         return w
 
     def _on_file_selected(self, path: str):
@@ -5525,20 +5574,32 @@ class MainWindow(QMainWindow):
             self._mute_btn.setText("🔇  MICROPHONE MUTED")
             self._mute_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: #140006; color: {C.MUTED_C};
-                    border: 1px solid {C.MUTED_C}; border-radius: 3px;
+                    background: rgba(255, 51, 85, 0.08);
+                    color: {C.MUTED_C};
+                    border: 1px solid rgba(255, 51, 85, 0.4);
+                    border-radius: 4px;
+                    letter-spacing: 1px;
+                }}
+                QPushButton:hover {{
+                    background: rgba(255, 51, 85, 0.18);
                 }}
             """)
         else:
             self._mute_btn.setText("🎙  MICROPHONE ACTIVE")
             self._mute_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: #00140a; color: {C.GREEN};
-                    border: 1px solid {C.GREEN}; border-radius: 3px;
+                    background: rgba(0, 255, 136, 0.08);
+                    color: {C.GREEN};
+                    border: 1px solid rgba(0, 255, 136, 0.35);
+                    border-radius: 4px;
+                    letter-spacing: 1px;
                 }}
-                QPushButton:hover {{ background: #001f10; }}
+                QPushButton:hover {{
+                    background: rgba(0, 255, 136, 0.18);
+                    border: 1px solid {C.GREEN};
+                }}
             """)
-
+       
     def _send(self):
         txt = self._input.text().strip()
         if not txt: return
@@ -5600,6 +5661,7 @@ class JarvisUI:
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        _ur.apply_app_font(self._app)
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)
         self._win.show()
