@@ -314,6 +314,11 @@ def _render_prompt(template: str, values: dict) -> str:
 
 
 def _get_api_key() -> str:
+    # The key ladder lives in core/gemini.py: the first configured key that is
+    # not rejected and still has a Live model with quota.
+    k = _gemini.api_key()
+    if k:
+        return k
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
 
@@ -2161,9 +2166,11 @@ class JarvisLive:
                 # off a quota limit is skipped; the name is published back to
                 # LIVE_MODEL so plugins follow whatever is actually in use.
                 global LIVE_MODEL
-                LIVE_MODEL = _gemini.live_model()
-                live_model = LIVE_MODEL
-                print(f"[JARVIS] Live model: {live_model}")
+                live_key, live_model = _gemini.live_target()
+                LIVE_MODEL = live_model
+                print(f"[JARVIS] Live model: {live_model} "
+                      f"(API key {_gemini.key_label(live_key)}, "
+                      f"{len(_gemini.api_keys())} configured)")
 
                 _resumed_with = self._resume_handle is not None
                 config = self._build_config()
@@ -2172,7 +2179,7 @@ class JarvisLive:
                 # v1alpha carries proactive audio; if it gets rejected we fall
                 # back to v1beta.
                 client = genai.Client(
-                    api_key=_get_api_key(),
+                    api_key=live_key or _get_api_key(),
                     http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
                 )
 
@@ -2283,15 +2290,22 @@ class JarvisLive:
                 # difference between "JARVIS is quieter today" and "JARVIS does
                 # not start today": one model means one daily limit, and the
                 # limit always arrives mid-conversation.
-                if _gemini.note_live_failure(live_model, err_str):
-                    nxt = _gemini.live_model()
-                    self.ui.write_log(
-                        f"SYS: Switching to {nxt.split('/')[-1]} — the previous "
-                        f"model is out of quota."
-                        if nxt != live_model else
-                        "SYS: Every live model is rate-limited — retrying.")
-                    self._conn_backoff = 0 if nxt != live_model else 15
-                    if nxt == live_model:
+                if _gemini.note_live_failure(live_model, err_str, key=live_key):
+                    nxt_key, nxt = _gemini.live_target()
+                    moved = (nxt_key, nxt) != (live_key, live_model)
+                    if moved and nxt_key != live_key:
+                        _ks = _gemini.api_keys()
+                        _n  = _ks.index(nxt_key) + 1 if nxt_key in _ks else "?"
+                        _msg = (f"SYS: Switching to backup API key {_n} — the "
+                                f"previous key is out of quota or was rejected.")
+                    elif moved:
+                        _msg = (f"SYS: Switching to {nxt.split('/')[-1]} — the "
+                                f"previous model is out of quota.")
+                    else:
+                        _msg = "SYS: Every live model is rate-limited — retrying."
+                    self.ui.write_log(_msg)
+                    self._conn_backoff = 0 if moved else 15
+                    if not moved:
                         await asyncio.sleep(self._conn_backoff)
                     continue
 
