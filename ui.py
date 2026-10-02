@@ -1110,7 +1110,7 @@ class LogWidget(QTextEdit):
                 colon = self._text.find(":")
                 label = self._tag in ("you", "ai") and 0 <= colon < 24 and self._pos <= colon
                 if self._tag == "you":
-                    col = qcol(C.TEXT_MED if label else C.WHITE)
+                    col = qcol(C.GREEN if label else C.WHITE)
                 elif self._tag == "ai":
                     col = qcol(C.PRI if label else C.TEXT)
                 elif self._tag == "err":
@@ -1475,11 +1475,11 @@ class SetupOverlay(QWidget):
         sep.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep)
         layout.addSpacing(4)
 
-        layout.addWidget(_lbl("GEMINI API KEY", 8, color=C.TEXT_DIM,
+        layout.addWidget(_lbl("GEMINI API KEY(S)  —  add backups after commas", 8, color=C.TEXT_DIM,
                                align=Qt.AlignmentFlag.AlignLeft))
         self._key_input = QLineEdit()
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setPlaceholderText("AIza…")
+        self._key_input.setPlaceholderText("AIza…  (backup keys: AIza…, AIza…)")
         self._key_input.setFont(QFont("Courier New", 10))
         self._key_input.setFixedHeight(32)
         self._key_input.setStyleSheet(f"""
@@ -3947,17 +3947,19 @@ class MainWindow(QMainWindow):
         # GPU
         gpu = snap["gpu"]
         if gpu >= 0:
+            self._bar_gpu.setVisible(True)
             self._bar_gpu.set_value(gpu, f"{gpu:.0f}%")
         else:
-            self._bar_gpu.set_value(0, "N/A")
+            self._bar_gpu.setVisible(False)
 
         # TMP
         tmp = snap["tmp"]
         if tmp >= 0:
+            self._bar_tmp.setVisible(True)
             tmp_pct = min(100, (tmp / 100) * 100)
             self._bar_tmp.set_value(tmp_pct, f"{tmp:.0f}°C")
         else:
-            self._bar_tmp.set_value(0, "N/A")
+            self._bar_tmp.setVisible(False)
 
         try:
             boot_t  = psutil.boot_time()
@@ -4059,7 +4061,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _tick_clock(self):
-        self._clock_lbl.setText(time.strftime("%H:%M:%S"))
+        self._clock_lbl.setText(time.strftime("%H:%M:%S %p"))
         self._date_lbl.setText(time.strftime("%a %d %b %Y"))
 
     def _build_left_panel(self) -> QWidget:
@@ -4078,7 +4080,7 @@ class MainWindow(QMainWindow):
         lay.addSpacing(2)
 
         self._bar_cpu = MetricBar("CPU", C.PRI)
-        self._bar_mem = MetricBar("MEM", C.ACC2)
+        self._bar_mem = MetricBar("RAM", C.ACC2)
         self._bar_net = MetricBar("NET", C.GREEN)
         self._bar_gpu = MetricBar("GPU", C.ACC)
         self._bar_tmp = MetricBar("TMP", "#ff6688")
@@ -5616,7 +5618,8 @@ class MainWindow(QMainWindow):
         if not API_FILE.exists(): return False
         try:
             d = json.loads(API_FILE.read_text(encoding="utf-8"))
-            return bool(d.get("gemini_api_key")) and bool(d.get("os_system"))
+            has_key = bool(d.get("gemini_api_key")) or bool(d.get("gemini_api_keys"))
+            return has_key and bool(d.get("os_system"))
         except Exception:
             return False
 
@@ -5635,10 +5638,37 @@ class MainWindow(QMainWindow):
 
     def _on_setup_done(self, key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
-            encoding="utf-8",
-        )
+        # Read-modify-write. This used to replace the whole file with just the
+        # key and the OS, which silently erased the assistant's name, colours,
+        # the detected camera, plugin settings — and now the backup keys.
+        data = _read_full_config()
+        entered = key.replace(",", " ").split()
+        old: list[str] = []
+        for v in (data.get("gemini_api_key"), data.get("gemini_api_keys")):
+            if isinstance(v, (list, tuple)):
+                old.extend(str(x) for x in v)
+            elif v:
+                old.append(str(v))
+        old = [k for item in old for k in item.replace(",", " ").split()]
+        # What was just typed goes to the front of the ladder; earlier keys
+        # follow, so a good key is never lost. (A rejected one is simply tried
+        # once and set aside again.)
+        ladder: list[str] = []
+        for k in entered + old:
+            if k and k not in ladder:
+                ladder.append(k)
+        data["gemini_api_key"] = ladder[0]
+        if len(ladder) > 1:
+            data["gemini_api_keys"] = ladder[1:]
+        else:
+            data.pop("gemini_api_keys", None)
+        data["os_system"] = os_name
+        API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        try:                       # the key list is cached; make it see the new keys now
+            from core import gemini as _g
+            _g.api_keys(refresh=True)
+        except Exception:
+            pass
         self._ready = True
         if self._overlay:
             self._overlay.hide()
