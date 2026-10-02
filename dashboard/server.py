@@ -325,9 +325,95 @@ _ensure_crypto_js()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+# Adapters a phone can never reach: VPNs, virtual switches, hotspot/loopback shims.
+_VIRTUAL_NIC = re.compile(
+    r"vethernet|virtualbox|vmware|vmnet|hyper-v|wsl|docker|veth|virbr|br-|tailscale|"
+    r"zerotier|radmin|hamachi|wireguard|openvpn|nord|proton|express|\bvpn\b|\btap\b|"
+    r"tap-|\btun\b|loopback|bluetooth|pseudo|isatap|teredo|npcap|"
+    r"local area connection\*",
+    re.I,
+)
+
+
+def _lan_candidates() -> list[tuple[int, str, str]]:
+    """Every usable IPv4 address on this PC as (score, ip, adapter name), best first.
+
+    The old code asked the OS "which address do you use to reach 8.8.8.8?". With a
+    VPN on (common here, because Gemini Live may need one) that is the VPN's
+    address, which the phone cannot reach. The QR code then points nowhere and the
+    page spins until the browser gives up. Ranking real Wi-Fi/Ethernet adapters
+    above virtual ones fixes that.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return []
+    out: list[tuple[int, str, str]] = []
+    try:
+        stats = psutil.net_if_stats()
+        for name, addrs in psutil.net_if_addrs().items():
+            st = stats.get(name)
+            if st is not None and not st.isup:
+                continue
+            for a in addrs:
+                if a.family != socket.AF_INET:
+                    continue
+                ip = a.address
+                if not ip or ip.startswith(("127.", "169.254.")) or ip == "0.0.0.0":
+                    continue
+                score = 0
+                if ip.startswith("192.168."):
+                    score += 50
+                elif ip.startswith("10."):
+                    score += 30
+                elif re.match(r"172\.(1[6-9]|2\d|3[01])\.", ip):
+                    score += 20
+                if re.match(r"100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.", ip):
+                    score -= 40                      # CGNAT / Tailscale range
+                if _VIRTUAL_NIC.search(name):
+                    score -= 60
+                if re.search(r"wi-?fi|wlan|wireless|wlp|\ben\d|enp|eno|eth\d|ethernet", name, re.I):
+                    score += 25
+                out.append((score, ip, name))
+    except Exception:
+        return []
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
+def _configured_ip() -> str | None:
+    """Manual override: "dashboard_ip": "192.168.0.105" in config/api_keys.json."""
+    try:
+        import json as _json
+        with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
+            v = str(_json.load(f).get("dashboard_ip") or "").strip()
+        return v or None
+    except Exception:
+        return None
+
+
+def _https_wanted() -> bool:
+    """"dashboard_https": false in config/api_keys.json forces plain HTTP."""
+    try:
+        import json as _json
+        with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
+            return bool(_json.load(f).get("dashboard_https", True))
+    except Exception:
+        return True
+
+
 def _local_ip() -> str:
-    """Return the best LAN-facing IPv4 address, no internet required."""
-    # Method 1: route trick (fast, works when internet is available)
+    """Return the best LAN-facing IPv4 address for the phone to use."""
+    manual = _configured_ip()
+    if manual:
+        return manual
+
+    # Preferred: rank the real adapters (skips VPN / virtual switches).
+    ranked = _lan_candidates()
+    if ranked and ranked[0][0] > -30:
+        return ranked[0][1]
+
+    # Fallback 1: route trick (works when internet is available)
     for probe in ("8.8.8.8", "1.1.1.1", "192.168.1.1"):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -340,7 +426,7 @@ def _local_ip() -> str:
         except Exception:
             pass
 
-    # Method 2: hostname resolution (works offline on most systems)
+    # Fallback 2: hostname resolution (works offline on most systems)
     try:
         ip = socket.gethostbyname(socket.gethostname())
         if not ip.startswith("127."):
@@ -348,7 +434,7 @@ def _local_ip() -> str:
     except Exception:
         pass
 
-    # Method 3: enumerate all interfaces (fully offline, no external deps)
+    # Fallback 3: enumerate all interfaces
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             ip = info[4][0]
@@ -453,6 +539,31 @@ def _read(name: str) -> str:
 
 # ── DashboardServer ───────────────────────────────────────────────────────────
 
+def _port_free(port: int) -> bool:
+    """False if something (usually a second JARVIS) already listens on this port."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1) if hasattr(socket, "SO_EXCLUSIVEADDRUSE") else None
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _report_failure(what: str, exc: BaseException) -> None:
+    """A task that dies inside asyncio.create_task() is invisible: nothing is
+    printed, the QR code still appears, and the phone just spins. Say so."""
+    import traceback
+    print(f"[Dashboard] The {what} stopped: {type(exc).__name__}: {exc}")
+    try:
+        traceback.print_exc()
+    except Exception:
+        pass
+    print("[Dashboard] The phone cannot connect until this is fixed. See config/jarvis.log.")
+
+
 class DashboardServer:
 
     def __init__(self):
@@ -466,8 +577,12 @@ class DashboardServer:
         self._wake_callback               = None
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
+        self._used_keys: dict[str, tuple] = {}   # key -> (time, client ip, token, device token)
+        self.ready                        = False   # True once the web server is really listening
+        self.port_conflict                = False   # True if another program already owns the port
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
+        self.phone_mic_open               = 0   # live /ws/phone-audio sockets; >0 means "the phone is the microphone"
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
@@ -484,6 +599,8 @@ class DashboardServer:
 
     @staticmethod
     def _ssl_enabled() -> bool:
+        if not _https_wanted():
+            return False
         certs = BASE_DIR / "config" / "certs"
         return (certs / "jarvis.key").exists() and (certs / "jarvis.crt").exists()
 
@@ -586,36 +703,17 @@ class DashboardServer:
             return JSONResponse({"ok": False, "error": "Invalid or expired key"},
                                 status_code=401)
 
-        @app.get("/auto-login")
-        async def auto_login(key: str = ""):
-            """QR code target — validates one-time key, creates session, redirects phone."""
-            now = time.time()
-            if not key or key not in self._pending_keys or self._pending_keys[key] <= now:
-                return HTMLResponse("""<!DOCTYPE html>
+        def _problem_page(title: str, text: str) -> HTMLResponse:
+            return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>
-  body{background:#07090f;color:#dde3ed;font-family:sans-serif;
-       display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}
-  h2{color:#f87171;margin-bottom:12px}p{color:#5e6a7e;font-size:14px}
+  body{{background:#07090f;color:#dde3ed;font-family:sans-serif;
+       display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}}
+  h2{{color:#f87171;margin-bottom:12px}}p{{color:#8b97ab;font-size:15px;max-width:340px;line-height:1.5}}
 </style></head>
-<body><div><h2>Link Expired</h2>
-<p>Press <strong style="color:#dde3ed">Remote Control</strong> in JARVIS to get a new QR code.</p>
-</div></body></html>""")
+<body><div><h2>{title}</h2><p>{text}</p></div></body></html>""")
 
-            del self._pending_keys[key]
-            tok     = secrets.token_urlsafe(32)
-            dev_tok = secrets.token_urlsafe(32)
-            self._tokens.add(tok)
-            self._token_keys[tok] = key
-            self._aes_key(key)
-            self._device_sessions[dev_tok] = {"session_key": key}
-
-            if self._connect_callback:
-                self._connect_callback()
-            asyncio.create_task(self.broadcast(
-                {"type": "sys", "text": "Remote connection established via QR code."}
-            ))
-
+        def _connected_page(tok: str, key: str, dev_tok: str) -> HTMLResponse:
             return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>
@@ -630,8 +728,58 @@ class DashboardServer:
   localStorage.setItem('jarvis_device_token','{dev_tok}');
   setTimeout(function(){{location.replace('/')}},400);
 </script>
-<p>Connecting to JARVIS…</p>
+<p>Connecting to JARVIS</p>
 </body></html>""")
+
+        # How long the SAME phone may open the same QR link again after the first
+        # time. Phone QR scanners and browsers routinely fetch a link twice (the
+        # scanner's own preview, then Chrome; or a page reload / restored tab). A
+        # strictly one-use key made the second fetch say "Link Expired" even though
+        # the first one had worked.
+        _REPLAY_SECS = 180
+
+        @app.get("/auto-login")
+        async def auto_login(req: Request, key: str = ""):
+            """QR code target: validates the one-time key, creates a session, redirects."""
+            now = time.time()
+            ip  = req.client.host if req.client else ""
+
+            used = self._used_keys.get(key)
+            if used and (now - used[0]) < _REPLAY_SECS and used[1] == ip:
+                return _connected_page(used[2], key, used[3])      # same phone, same link
+            if used:
+                return _problem_page(
+                    "Link already used",
+                    "This QR code has already been used. Press <b>Remote Control</b> in JARVIS to get a new one.")
+
+            if key and key in self._pending_keys and self._pending_keys[key] <= now:
+                return _problem_page(
+                    "Link expired",
+                    "This QR code is older than 10 minutes. Press <b>Remote Control</b> in JARVIS to get a new one.")
+
+            if not key or key not in self._pending_keys:
+                return _problem_page(
+                    "Wrong JARVIS",
+                    "This code was not made by the JARVIS answering here. If JARVIS is open twice "
+                    "(for example once in VS Code and once from the desktop shortcut), close one of them, "
+                    "then press <b>Remote Control</b> again.")
+
+            del self._pending_keys[key]
+            tok     = secrets.token_urlsafe(32)
+            dev_tok = secrets.token_urlsafe(32)
+            self._tokens.add(tok)
+            self._token_keys[tok] = key
+            self._aes_key(key)
+            self._device_sessions[dev_tok] = {"session_key": key}
+            self._used_keys = {k: v for k, v in self._used_keys.items() if now - v[0] < 900}
+            self._used_keys[key] = (now, ip, tok, dev_tok)
+
+            if self._connect_callback:
+                self._connect_callback()
+            asyncio.create_task(self.broadcast(
+                {"type": "sys", "text": "Remote connection established via QR code."}
+            ))
+            return _connected_page(tok, key, dev_tok)
 
         @app.post("/api/device-login")
         async def device_login_ep(req: Request):
@@ -700,6 +848,7 @@ class DashboardServer:
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
+            self.phone_mic_open += 1
             asyncio.create_task(self.broadcast(
                 {"type": "sys", "text": "Phone microphone live."}
             ))
@@ -715,6 +864,7 @@ class DashboardServer:
             except WebSocketDisconnect:
                 pass
             finally:
+                self.phone_mic_open = max(0, self.phone_mic_open - 1)
                 asyncio.create_task(self.broadcast(
                     {"type": "sys", "text": "Phone microphone stopped."}
                 ))
@@ -840,6 +990,22 @@ class DashboardServer:
     # ── serve ─────────────────────────────────────────────────────────────
 
     async def _serve_alias(self) -> None:
+        try:
+            await self._serve_alias_inner()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            _report_failure("HTTPS alias port", e)
+
+    async def serve(self) -> None:
+        try:
+            await self._serve_inner()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            _report_failure("dashboard", e)
+
+    async def _serve_alias_inner(self) -> None:
         """Second HTTPS server on PORT+1 sharing the same app and in-memory state.
         Chrome HTTPS-upgrades any bare IP:PORT the user types, so this port also needs TLS.
         User types IP:8001 → Chrome tries https → self-signed cert warning → accept once → done."""
@@ -847,13 +1013,13 @@ class DashboardServer:
         ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
         asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
         cfg = uvicorn.Config(
-            self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
+            self.app, host="0.0.0.0", port=PORT + 1, log_level="warning", log_config=None,
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
         )
         print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
         await uvicorn.Server(cfg).serve()
 
-    async def serve(self) -> None:
+    async def _serve_inner(self) -> None:
         if not _DEPS_OK:
             print("[Dashboard] fastapi/uvicorn not installed — dashboard disabled.")
             print("[Dashboard] Run:  pip install fastapi 'uvicorn[standard]' cryptography")
@@ -864,21 +1030,47 @@ class DashboardServer:
         asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT)
 
         # Generate the TLS pair on first run so no private key ships in the repo.
-        _ensure_certs()
+        if _https_wanted():
+            _ensure_certs()
 
         use_ssl  = self._ssl_enabled()
         ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
         ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
 
+        if not _port_free(PORT):
+            self.port_conflict = True
+            print(f"[Dashboard] Port {PORT} is already in use by another program.")
+            print("[Dashboard] Most likely JARVIS is already running (VS Code, the desktop shortcut or auto-start).")
+            print("[Dashboard] A phone would reach THAT copy, whose QR codes differ - hence 'Link expired'.")
+            print("[Dashboard] Close the other JARVIS (Task Manager > python / pythonw) and start again.")
+            return
+
         if use_ssl:
             asyncio.create_task(self._serve_alias())
 
         cfg = uvicorn.Config(
-            self.app, host="0.0.0.0", port=PORT, log_level="warning",
+            self.app, host="0.0.0.0", port=PORT, log_level="warning", log_config=None,
             **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
         )
 
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
+        others = [(ip, n) for _, ip, n in _lan_candidates() if ip != self._ip]
+        if others:
+            print("[Dashboard] If the phone cannot open that, it may be on a different network. Other addresses on this PC:")
+            for ip, n in others:
+                print(f"[Dashboard]   {proto}://{ip}:{PORT}   ({n})")
+            print('[Dashboard] To pin one: set "dashboard_ip" in config/api_keys.json')
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
-        await uvicorn.Server(cfg).serve()
+        server = uvicorn.Server(cfg)
+
+        async def _watch_ready() -> None:
+            for _ in range(200):
+                if server.started:
+                    self.ready = True
+                    return
+                await asyncio.sleep(0.1)
+
+        asyncio.create_task(_watch_ready())
+        await server.serve()
+        self.ready = False
