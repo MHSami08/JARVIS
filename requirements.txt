@@ -42,6 +42,15 @@ pillow>=10,<13
 opencv-python>=4.8,<5
 mss>=9,<11
 
+# ── Screen targeting ──────────────────────────────────────────────────────────
+# rapidocr-onnxruntime is the FALLBACK text detector for core/ui_grounding. On
+# Windows the OS engine above is used instead — it is roughly 70x faster — so
+# this only runs where winsdk is unavailable, or when the OCR language pack is
+# missing. It is a large download (an ONNX runtime plus the PP-OCRv4 models), so
+# it is imported lazily and a missing install disables exactly one fallback
+# layer, never the app.
+rapidocr-onnxruntime
+
 # ── System, files & documents ─────────────────────────────────────────────────
 psutil>=5.9,<8
 send2trash                   # file_controller — recoverable deletes
@@ -78,6 +87,17 @@ wmi;        sys_platform == "win32"
 # screen_agent (to aim without a model call), the WhatsApp pair, and
 # game_updater (Steam's install dialog).
 pywinauto;  sys_platform == "win32"
+# uiautomation is what core/ui_grounding actually aims with. It reads the same
+# accessibility tree as pywinauto but is far cheaper per query, which matters
+# because it runs inside the click path — a button resolves in ~10-40 ms with no
+# model call, which is what makes an exact click feel instant. pywinauto stays
+# as the fallback for the plugins above and for when this is not installed.
+uiautomation;  sys_platform == "win32"
+# winsdk exposes Windows.Media.Ocr, the OCR engine built into Windows. It reads
+# a full 1080p window in ~0.1 s where the ONNX alternative below takes ~7 s, so
+# it is the one used whenever it is available. No model download: it uses the
+# OCR language pack the OS already has.
+winsdk;  sys_platform == "win32"
 
 # ── Documents, media & hardware readouts ──────────────────────────────────────
 # Also try/except-guarded at the point of use. They are declared because a

@@ -93,7 +93,8 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
-    get_noise_gate,
+    get_noise_gate, get_barge_in_enabled, get_barge_in_sensitivity,
+    save_barge_in_enabled, save_barge_in_sensitivity,
 )
 from core                     import gemini as _gemini
 from core.plugin_loader        import discover_plugins
@@ -102,6 +103,7 @@ from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
+from core.barge_in             import BargeInDetector
 from core.noise_gate           import NoiseGate
 from core.viseme               import VisemeStream
 from core.wake_word            import (
@@ -246,29 +248,6 @@ def _pcm_visemes(samples, sr: int = 24000):
         return []
 
 
-def _describe_tools(declarations) -> str:
-    """One line per capability, straight from the live tool declarations.
-
-    Derived rather than written down: the action and plugin registries are
-    discovered at startup, so whatever the user has installed is what the model
-    is told it can do. Adding a plugin extends this by itself, and removing one
-    stops the model from claiming an ability it no longer has.
-    """
-    lines = []
-    for d in declarations or ():
-        try:
-            name = d.get("name") if isinstance(d, dict) else getattr(d, "name", None)
-            desc = (d.get("description") if isinstance(d, dict)
-                    else getattr(d, "description", "")) or ""
-        except Exception:
-            continue
-        if not name:
-            continue
-        desc = " ".join(str(desc).split())
-        lines.append(f"- {name}: {desc[:150]}" if desc else f"- {name}")
-    return "\n".join(lines)
-
-
 def _describe_limits(has_vision: bool, has_mic: bool) -> str:
     """The other half of self-knowledge: what is out of reach, and why.
 
@@ -338,6 +317,20 @@ _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 # Transcript chunks shorter than this may legitimately repeat ("evet, evet"),
 # so only longer ones are treated as duplicates.
 _REPEAT_MIN = 12
+
+# How long a single tool call may run before the session gives up on it.
+#
+# A tool that never returns blocks `_receive_audio`, which is the only place the
+# Live session is read — so while one hangs, nothing is received, no pong is
+# sent, and the server eventually drops the connection with "1011 keepalive ping
+# timeout". One wedged action (a browser that never comes back, a request with
+# no timeout inside it) therefore takes the whole conversation with it.
+#
+# Generous on purpose: it is a backstop, not a deadline. The slowest legitimate
+# action declares 90 s for itself, so this sits well clear of honest work and
+# only catches the genuinely stuck. On expiry the tool reports that it timed out
+# and the model answers around it — the session survives either way.
+_TOOL_TIMEOUT_S = 180.0
 
 
 def _is_repeat_chunk(txt: str, buf: list) -> bool:
@@ -591,6 +584,15 @@ class JarvisLive:
         self._ptt                  = None    # core.hotkey.PushToTalk
         self._out_level            = 0.0     # level of the audio being played right now
         self._echo                 = EchoGuard()
+        # Barge-in: speaking over JARVIS cuts the reply short. Built always (it
+        # is inert until enabled) so the settings toggle is a flag flip rather
+        # than something that has to be constructed on a live audio thread.
+        self._barge_enabled        = get_barge_in_enabled()
+        self._barge                = BargeInDetector(
+            self._echo,
+            sensitivity=get_barge_in_sensitivity(),
+            logger=lambda m: print(f"[BargeIn] {m}"),
+        )
         _ng = get_noise_gate()
         self._noise_gate           = NoiseGate(_ng["strength"]) if _ng["enabled"] else None
         # `stream.write()` returns when the buffer accepts the audio, not when the
@@ -630,6 +632,9 @@ class JarvisLive:
         # conversation that never ends never produces a summary, and the
         # "yesterday we talked about…" line silently disappears.
         self._resume_handle: str | None = None
+        # Last prompt size the server reported, so the token line above prints
+        # once per change rather than on every message of a session.
+        self._last_prompt_tokens: int | None = None
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
@@ -684,12 +689,40 @@ class JarvisLive:
                 self.set_push_to_talk(True)
             except Exception as e:
                 print(f"[JARVIS] ⚠ Push-to-talk unavailable: {e}")
+        # UI control surface for the Voice Interrupt settings row. Read through
+        # the live object rather than the saved config so the row always shows
+        # what the audio path is actually doing.
+        self.ui.get_barge_state   = self._barge_state     # () -> dict
+        self.ui.on_barge_toggle   = self.set_barge_in     # (enable) -> str
         # UI control surface for the Wake Word settings section.
         self.ui.wake_is_ready    = wake_is_ready          # () -> bool
         self.ui.wake_get_state   = self._wake_state       # () -> dict
         self.ui.on_wake_toggle   = self._ui_wake_toggle   # (enable: bool) -> str
         self.ui.on_wake_manual   = self._ui_wake_manual   # () -> toggle awake/asleep
         self.ui.on_wake_install  = self._ui_wake_install  # () -> (ok, msg)
+
+    # ── Barge-in ─────────────────────────────────────────────────────────────
+
+    def _barge_state(self) -> dict:
+        """What the Voice Interrupt row should display.
+
+        Read from the detector rather than from config, so the row reflects what
+        the microphone callback is actually doing. `ready` is the honest part:
+        the guard needs to hear a sentence or two of JARVIS before it knows this
+        room's echo, and until then interruptions are held back.
+        """
+        try:
+            s = self._barge.stats
+            return {
+                "enabled":     self._barge_enabled,
+                "sensitivity": s.get("sensitivity", "medium"),
+                "calibrated":  bool(s.get("calibrated")),
+                "reliable":    bool(s.get("reliable", True)),
+                "echo_floor":  s.get("echo_floor", 0.0),
+            }
+        except Exception:
+            return {"enabled": self._barge_enabled, "sensitivity": "medium",
+                    "calibrated": False, "reliable": True, "echo_floor": 0.0}
 
     # ── Wake word: state machine ─────────────────────────────────────────────
 
@@ -728,6 +761,11 @@ class JarvisLive:
         if not self._awake:
             return
         self._awake = False
+        # Asleep means the microphone is not being listened to at all, so any
+        # half-gathered interruption is meaningless — and the wake gate returns
+        # before the falling edge would otherwise clear it, which would leave the
+        # state stale across the sleep.
+        self._barge.reset()
         self.set_speaking(False)
         self.ui.set_state("SLEEPING")
         self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
@@ -948,6 +986,41 @@ class JarvisLive:
             pass
         return scope
 
+    def set_barge_in(self, enabled: bool, sensitivity: str | None = None) -> str:
+        """Turn voice interruption on or off. Called from the Qt thread.
+
+        Nothing is constructed here — the detector already exists and this only
+        flips the flag the microphone callback reads. It is deliberately that
+        cheap: the callback is a real-time audio thread, and anything that could
+        block there would drop samples.
+        """
+        self._barge_enabled = bool(enabled)
+        if sensitivity is not None:
+            self._barge.sensitivity = sensitivity
+        save_barge_in_enabled(self._barge_enabled)
+        if sensitivity is not None:
+            save_barge_in_sensitivity(self._barge.sensitivity)
+
+        if not self._barge_enabled:
+            self._barge.reset()
+            return "off"
+
+        # Say what it will actually do, including the honest part. The room this
+        # is running in decides how well it works, and the guard only knows that
+        # after it has heard a sentence or two — so report the state at the
+        # moment of switching on rather than implying it is settled.
+        try:
+            _s = self._barge.stats
+            _room = ("still calibrating" if not _s.get("calibrated")
+                     else "quiet room" if _s.get("reliable")
+                     else "difficult room — needs sustained speech")
+            self.ui.write_log(
+                f"SYS: Voice interrupt on — sensitivity {self._barge.sensitivity}, "
+                f"{_room}.")
+        except Exception:
+            pass
+        return "on"
+
     def _on_ptt(self, held: bool) -> None:
         """Chord pressed or released — may arrive on the hotkey thread."""
         self._ptt_held = held
@@ -980,6 +1053,17 @@ class JarvisLive:
         # The words we were about to mouth are never going to be spoken now.
         self._visemes.reset()
         self._play_cursor = 0.0     # next batch starts a fresh timeline
+        # The echo tail opened by set_speaking(False) is deliberately LEFT ALONE.
+        #
+        # Draining the queue does not silence the speakers: the device buffer
+        # still holds a couple of hundred milliseconds that are about to be
+        # heard. Streaming the microphone through that without a guard is how the
+        # assistant hears the end of the sentence it just abandoned and answers
+        # it. The tail already handles the genuine case correctly — it passes a
+        # real voice through and ends itself on the first block that is not our
+        # echo — so a user who is mid-sentence loses at most one block (~64 ms)
+        # and a cough that triggered a false positive does not become input.
+        self._barge.reset()
         if self._turn_done_event:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
@@ -1056,7 +1140,6 @@ class JarvisLive:
         sys_prompt = _render_prompt(sys_prompt, {
             "assistant_name": self._asst_name,
             "platform": f"{_platform.system()} {_platform.release()}".strip(),
-            "capabilities": _describe_tools(_all_decls),
             "limits": _describe_limits(
                 has_vision="screen_process" in _names,
                 has_mic=True,
@@ -1074,11 +1157,6 @@ class JarvisLive:
             input_audio_transcription={},
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": _all_decls}],
-            # Asks the server to issue session-resumption handles. Enabled but
-            # NOT yet used: no handle is captured from the resumption update and
-            # none is passed back here, so a reconnect starts a fresh session
-            # rather than continuing the old one. Left on because the handles
-            # cost nothing and are the prerequisite for doing it properly.
             # Hand back the handle captured from the last session_resumption
             # update. `handle=None` is exactly the old behaviour (ask for
             # handles, start fresh), so the first connect of a run is unchanged.
@@ -1288,7 +1366,12 @@ class JarvisLive:
                     args["file_path"] = self.ui.current_file
                 _ctx = {"player": self.ui, "speak": self.speak,
                         "response": None, "session_memory": None}
-                r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
+                # Bounded: a tool that never returns would block the receive
+                # loop and cost the whole session (see _TOOL_TIMEOUT_S).
+                r = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx)),
+                    timeout=_TOOL_TIMEOUT_S,
+                )
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
                 if (name == "web_search" and r
@@ -1301,9 +1384,13 @@ class JarvisLive:
 
             else:
                 if self._plugin_registry.has(name):
-                    r = await loop.run_in_executor(
-                        None,
-                        lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+                    # Bounded for the same reason as the action path above.
+                    r = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+                        ),
+                        timeout=_TOOL_TIMEOUT_S,
                     )
                     result = r or "Done."
                 else:
@@ -1380,14 +1467,42 @@ class JarvisLive:
             # the echo of what we are playing right now", sustained long enough
             # that a cough or a keystroke cannot trigger it.
             if jarvis_speaking:
-                # Nothing is streamed while JARVIS talks.
+                # Nothing is streamed while JARVIS talks. The microphone is still
+                # *listened* to locally, though, so the user can talk over it.
                 #
-                # Interrupting by voice used to live here: `EchoGuard` can pick a
-                # user out from under our own echo, and `core/echo.py` still does
-                # that for the tail below. Re-enabling is small — classify each
-                # block here and call interrupt() after `required_blocks` of
-                # agreement — but it depends on the listener's room, so it stays
-                # out until it can be tried on real hardware.
+                # Note the speaking state first, whatever we do next: this is
+                # where the detector sees the rising edge that starts a new reply,
+                # and a missed edge would let evidence from the previous sentence
+                # count towards cutting off this one.
+                self._barge.note_speaking(True)
+
+                # The phone is the microphone: the PC mic hears the room from
+                # wherever the desktop is, which is not where the user is. Letting
+                # it interrupt would have a conversation on the phone cut short by
+                # a television in the next room. The phone relay does its own
+                # interruption handling against the stream it actually receives.
+                if not self._barge_enabled or self._phone_blocks_pc_mic():
+                    return
+
+                # Interrupting by voice. The hard part is echo — on speakers the
+                # mic hears JARVIS — so the test is not "is the mic loud" but
+                # "is this a different voice from the one we are playing", held
+                # for long enough that a cough or a keystroke cannot trigger it.
+                # EchoGuard answers the first; BargeInDetector answers the second.
+                #
+                # The decision is made here on the audio thread, but stopping
+                # playback touches an asyncio queue, which is not thread-safe, so
+                # the interrupt itself is marshalled onto the event loop. This
+                # callback must return fast — it is a real-time audio thread, and
+                # blocking it drops microphone samples.
+                try:
+                    if self._barge.consider(
+                            indata, SEND_SAMPLE_RATE, _pcm_level(indata)):
+                        _loop = self._loop
+                        if _loop is not None and not _loop.is_closed():
+                            _loop.call_soon_threadsafe(self.interrupt)
+                except Exception:
+                    pass   # never let a barge-in decision kill the mic stream
                 return
 
             # ── Echo tail ────────────────────────────────────────────────────
@@ -1396,6 +1511,14 @@ class JarvisLive:
             # it was addressed, and answers its own last sentence. The microphone
             # stays OPEN — the guard only drops blocks that are our own voice, so
             # replying the instant it stops still works.
+            #
+            # The speaking flag dropping is also the falling edge for barge-in.
+            # The reset itself happens on the *next* rising edge rather than
+            # here, which is deliberate: clearing on the way down would leave a
+            # window in which the state is already blank while the old reply is
+            # still being classified. Tying it to the start of a reply means the
+            # slate is clean at exactly the moment it needs to be.
+            self._barge.note_speaking(False)
             if self._tail_active():
                 try:
                     if not self._echo.is_user_speech(
@@ -1529,6 +1652,33 @@ class JarvisLive:
             while True:
                 async for response in self.session.receive():
 
+                    # ── GoAway ───────────────────────────────────────────────
+                    # The Live API does not let a session run forever. It sends
+                    # this to warn that the connection is about to close, then
+                    # force-closes with 1008 if the client has not already left.
+                    #
+                    # Not reading it is why a long conversation ended with
+                    # "1008 None. Connection aborted because the client failed to
+                    # close the connection after receiving a GoAway signal" and an
+                    # ExceptionGroup on the next launch — the session was killed
+                    # rather than cycled. Leaving first is the whole fix.
+                    #
+                    # Immediately, not after `time_left`: that field is a hint,
+                    # and anything slow in this loop (a tool call, a long
+                    # generation) lets the 1008 land first. Rebuilding now costs
+                    # one reconnect and keeps the conversation, because the
+                    # resumption handle captured below is replayed into the next
+                    # session — so this is a hiccup, not a reset.
+                    _goaway = getattr(response, "go_away", None)
+                    if _goaway is not None:
+                        _left = getattr(_goaway, "time_left", None)
+                        print(f"[JARVIS] 🔄 Server is cycling the session "
+                              f"(time_left={_left!r}) — reconnecting.")
+                        self.ui.write_log(
+                            "SYS: Server is cycling the connection — reconnecting..."
+                        )
+                        raise _ReconnectSignal(keep_context=True)
+
                     # ── Session resumption ───────────────────────────────────
                     # The server sends this periodically. `resumable` goes false
                     # while a turn is mid-flight — replaying a handle from that
@@ -1541,6 +1691,22 @@ class JarvisLive:
                             if self._resume_handle is None:
                                 print("[JARVIS] 🔗 Session resumption armed")
                             self._resume_handle = _sru.new_handle
+
+                    # ── Token accounting ─────────────────────────────────────
+                    # The server reports the real prompt size here, which is the
+                    # only honest number for the fixed per-session cost: the
+                    # system prompt, every tool declaration and the memory block
+                    # are all resent on each connect. Without it, trimming the
+                    # payload is guesswork. Logged on change only — the server
+                    # repeats the same totals on many messages.
+                    _um = getattr(response, "usage_metadata", None)
+                    if _um is not None:
+                        _p = getattr(_um, "prompt_token_count", None)
+                        _t = getattr(_um, "total_token_count", None)
+                        if _p is not None and _p != self._last_prompt_tokens:
+                            self._last_prompt_tokens = _p
+                            print(f"[JARVIS] 📊 Prompt tokens {_p}"
+                                  + (f", total {_t}" if _t is not None else ""))
 
                     if response.data:
                         if self._interrupted:
@@ -1645,6 +1811,12 @@ class JarvisLive:
                             function_responses=fn_responses
                         )
                         await self._flush_pending_vision()
+        except _ReconnectSignal:
+            # A deliberate rebuild — a GoAway, or a settings change routed here.
+            # Not an error, so it must not be logged as one: without this it is
+            # caught by the `except Exception` below and printed with a full
+            # traceback, which reads like a crash in the log.
+            raise
         except Exception as e:
             print(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
@@ -2123,6 +2295,12 @@ class JarvisLive:
     # ── main loop ───────────────────────────────────────────────────────────
 
     async def run(self):
+        # Declared at the top of the function rather than at the assignment
+        # below: `global` must precede any use of the name in the same scope,
+        # and the connect loop reads LIVE_MODEL (to seed its failure handler)
+        # before it writes it.
+        global LIVE_MODEL
+
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
 
@@ -2159,13 +2337,35 @@ class JarvisLive:
             self._dashboard = None
 
         while True:
+            # Pre-seed the two names the failure handler below reads. They are
+            # assigned a few lines into the try, but the handler runs when that
+            # try fails BEFORE reaching them — and `except BaseException` catches
+            # everything, including an AttributeError from a bad import or a typo
+            # in a helper this loop calls. Reading them unset then raised
+            # UnboundLocalError inside the handler, which escaped the while-loop
+            # and killed the assistant's thread: the window stayed open on
+            # "THINKING" with no microphone and no reply, and the real error was
+            # never reported. Seeding them costs nothing and makes every startup
+            # failure reach the ladder logic below, which is where it can be
+            # reported and retried.
+            live_key, live_model = "", ""
+            _resumed_with = False
+            # True when this iteration is rebuilding a session that is still
+            # mid-conversation — a GoAway cycle, a voice change, a device
+            # switch — as opposed to the session genuinely ending. The `finally`
+            # below summarises and CLEARS `_session_log` when it is long enough,
+            # which is right at the end of a conversation and wrong in the
+            # middle of one: a GoAway cycle every few minutes would summarise
+            # the same conversation repeatedly, rewrite long_term.json each
+            # time, and wipe the transcript the ongoing session is still
+            # building. Set just before each `continue` that keeps the context.
+            _mid_session_rebuild = False
             try:
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
                 # Pick the rung to open the conversation on. A model resting
                 # off a quota limit is skipped; the name is published back to
                 # LIVE_MODEL so plugins follow whatever is actually in use.
-                global LIVE_MODEL
                 live_key, live_model = _gemini.live_target()
                 LIVE_MODEL = live_model
                 print(f"[JARVIS] Live model: {live_model} "
@@ -2199,6 +2399,9 @@ class JarvisLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    # A rebuild must not inherit a half-gathered interruption
+                    # from the session that just ended.
+                    self._barge.reset()
 
                     print("[JARVIS] Connected.")
                     if _resumed_with:
@@ -2256,6 +2459,13 @@ class JarvisLive:
                 # session immediately with no backoff and no scary logs.
                 if _is_reconnect_signal(e):
                     print("[JARVIS] Voluntary reconnect requested.")
+                    # Keeping the context means the user's conversation is still
+                    # going: the rebuild is a hiccup, not an ending, so the
+                    # summary-and-clear in `finally` must not run. Dropping it
+                    # (a voice change) really is the end of that conversation,
+                    # so the summary is still wanted there — hence the flag
+                    # simply mirrors whether the context is kept.
+                    _mid_session_rebuild = _keep_context_of(e)
                     if not _keep_context_of(e):
                         # A deliberate clean slate (voice change) — drop the
                         # handle so the next connect really does start empty.
@@ -2293,6 +2503,24 @@ class JarvisLive:
                 if _gemini.note_live_failure(live_model, err_str, key=live_key):
                     nxt_key, nxt = _gemini.live_target()
                     moved = (nxt_key, nxt) != (live_key, live_model)
+
+                    # Every key rejected. Reconnecting would reach the same wall
+                    # with the same dead key, so ask for a new one instead. This
+                    # is the one failure a ladder cannot climb out of by itself:
+                    # there is nothing below it to step onto.
+                    if _gemini.is_key_error(err_str) and not moved:
+                        self.ui.write_log(
+                            "ERR: The API key was rejected and no other key is "
+                            "configured — please enter a valid key."
+                        )
+                        self.ui.set_state("SLEEPING")
+                        self.ui.prompt_reconfig()
+                        while not self.ui._win._ready:
+                            await asyncio.sleep(1)
+                        print("[JARVIS] New API key saved — reconnecting...")
+                        self._conn_backoff = 3
+                        continue
+
                     if moved and nxt_key != live_key:
                         _ks = _gemini.api_keys()
                         _n  = _ks.index(nxt_key) + 1 if nxt_key in _ks else "?"
@@ -2347,7 +2575,7 @@ class JarvisLive:
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
                     print("[JARVIS] New API key saved — reconnecting...")
-                    _conn_backoff = 3
+                    self._conn_backoff = 3
                     continue
 
                 # Network / timeout errors — log clearly and back off
@@ -2356,18 +2584,32 @@ class JarvisLive:
                     "ConnectionRefusedError", "OSError", "Cannot connect",
                 ))
                 if is_net_err:
-                    _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
-                    self._conn_backoff = _conn_backoff
+                    self._conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
                     self.ui.write_log(
-                        f"NET: Connection failed — retrying in {_conn_backoff}s. "
+                        f"NET: Connection failed — retrying in {self._conn_backoff}s. "
                         "(a VPN may be required)"
                     )
                 else:
+                    # Something none of the cases above recognised. It used to
+                    # be logged to the console and nowhere else, which under
+                    # pythonw means nowhere at all — the app simply sat there
+                    # looking broken. Say it in the activity log too, in one
+                    # line, so an unexpected failure is visible where the user
+                    # is actually looking. The traceback still goes to
+                    # config/jarvis.log for the detail.
                     self._conn_backoff = 3
+                    self.ui.write_log(
+                        f"ERR: Could not start the session — "
+                        f"{type(e).__name__}: {err_str[:140]}"
+                    )
             finally:
                 self.session = None
-                # Only save if there was a real conversation (≥3 turns)
-                if len(self._session_log) >= 3:
+                # Only save if there was a real conversation (≥3 turns) that has
+                # actually ENDED. A mid-conversation rebuild — a GoAway cycle,
+                # an audio-device switch — reaches this `finally` too, and
+                # saving there would summarise and clear a conversation that is
+                # still in progress (see `_mid_session_rebuild` above).
+                if len(self._session_log) >= 3 and not _mid_session_rebuild:
                     asyncio.create_task(self._save_session_summary())
 
             self.set_speaking(False)
@@ -2381,6 +2623,27 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
+    # Declare DPI awareness before anything else exists.
+    #
+    # Windows defaults a process to DPI-UNAWARE, which means the OS lies about
+    # the screen: a 1920x1080 display at 150% scaling reports 1280x720 and every
+    # capture comes back upscaled and blurry. Worse, the mode can be changed
+    # under us — mss asks for PerMonitor-v2 on its first grab, pyautogui asks for
+    # the older v1 at import — so a screen size cached before the switch is
+    # wrong, which is how a click ends up somewhere other than where it was
+    # aimed.
+    #
+    # This has to run before QApplication is constructed (inside JarvisUI below),
+    # because Qt sets its own awareness at that moment and will not upgrade
+    # later. Setting it here is what makes the whole targeting chain agree on
+    # what a pixel is.
+    try:
+        from core.screen_geometry import ensure_dpi_awareness, describe
+        ensure_dpi_awareness()
+        print(f"[Screen] {describe()}")
+    except Exception as e:
+        print(f"[Screen] DPI setup failed (clicks may miss on a scaled display): {e}")
+
     ui = JarvisUI("face.png")
 
     def runner():

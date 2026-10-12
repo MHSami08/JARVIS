@@ -2999,6 +2999,8 @@ class MainWindow(QMainWindow):
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
+    _target_sig     = pyqtSignal(object, str, str, str, object)  # rect, label, badge, detail, dwell
+    _target_hide_sig = pyqtSignal()
     _wake_dl_sig    = pyqtSignal(bool, str)  # wake-word install finished (ok, message)
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
@@ -3040,6 +3042,8 @@ class MainWindow(QMainWindow):
         self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
         self.on_push_to_talk   = None   # callable: (enable: bool) -> str scope
         self.ptt_hold          = None   # callable: (held: bool) -> None — windowed chord
+        self.on_barge_toggle   = None   # callable: (enable: bool) -> str, set by JarvisLive
+        self.get_barge_state   = None   # callable: () -> dict {enabled, sensitivity, ...}
         self.wake_get_state    = None   # callable: () -> dict {enabled, awake, ready}
         self._muted            = False
         self._current_file: str | None = None
@@ -3275,6 +3279,8 @@ class MainWindow(QMainWindow):
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
+        self._target_sig.connect(self._show_target_overlay)
+        self._target_hide_sig.connect(self._hide_target_overlay)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._wake_btns_sig.connect(self._refresh_wake_btns)
@@ -4061,7 +4067,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _tick_clock(self):
-        self._clock_lbl.setText(time.strftime("%H:%M:%S %p"))
+        self._clock_lbl.setText(time.strftime("%I:%M:%S %p"))
         self._date_lbl.setText(time.strftime("%a %d %b %Y"))
 
     def _build_left_panel(self) -> QWidget:
@@ -4361,6 +4367,13 @@ class MainWindow(QMainWindow):
         self._ptt_btn = _row(QPushButton())
         self._ptt_btn.clicked.connect(self._toggle_ptt)
         self._refresh_talk_btns()
+
+        # Speaking over JARVIS to cut it off. Sits directly under push-to-talk
+        # because they are the two halves of the same question — how the
+        # microphone behaves while JARVIS has the floor.
+        self._barge_btn = _row(QPushButton())
+        self._barge_btn.clicked.connect(self._toggle_barge)
+        self._refresh_barge_btn()
 
         self._hud_btn = _row(QPushButton())
         self._hud_btn.clicked.connect(self._toggle_hud_style)
@@ -5188,6 +5201,102 @@ class MainWindow(QMainWindow):
             else "Hold a key to talk instead of streaming the mic continuously.")
 
 
+    def _refresh_barge_btn(self):
+        """Repaint the voice-interrupt row.
+
+        The switch state comes from the saved config, not from JarvisLive: this
+        row is built before the audio engine exists, so a callback that is not
+        wired yet would show OFF on a machine where it is switched on. The saved
+        config is authoritative for on/off either way — JarvisLive writes it
+        whenever the toggle changes.
+
+        The calibration hint is the opposite: only the live detector knows how
+        this room sounds, so that part is added when the callback is available
+        and simply omitted when it is not.
+        """
+        if not hasattr(self, "_barge_btn"):
+            return
+        from memory.config_manager import (get_barge_in_enabled,
+                                           get_barge_in_sensitivity)
+        _on = f"""
+            QPushButton {{ background: #001a08; color: {C.GREEN};
+                border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                text-align: left; padding: 0 8px; }}
+            QPushButton:hover {{ background: #002010; }}"""
+        _off = f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                text-align: left; padding: 0 8px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}"""
+
+        enabled = get_barge_in_enabled()
+        sens    = get_barge_in_sensitivity()
+
+        if not enabled:
+            self._barge_btn.setText("✋  INTERRUPT: OFF")
+            self._barge_btn.setStyleSheet(_off)
+            self._barge_btn.setToolTip(
+                "Let speaking over JARVIS stop it mid-sentence. Off by default "
+                "because how well it works depends on your room.")
+            return
+
+        self._barge_btn.setText(f"✋  INTERRUPT: {sens.upper()}")
+        self._barge_btn.setStyleSheet(_on)
+
+        # Ask the live detector how the room is doing, if it is running.
+        st = {}
+        if self.get_barge_state:
+            try:
+                st = self.get_barge_state() or {}
+            except Exception:
+                st = {}
+        if not st.get("calibrated"):
+            _note = ("Still measuring this room's echo — interruptions begin "
+                     "working after JARVIS has spoken a sentence or two.")
+        elif st.get("reliable", True):
+            _note = ("Speak over JARVIS and it stops. This room has been "
+                     "measured, so it can tell your voice from its own echo.")
+        else:
+            _note = ("This room returns a lot of echo, so it waits for clearly "
+                     "sustained speech. A headset mic would make it much more "
+                     "responsive.")
+        self._barge_btn.setToolTip(
+            f"Speaking over JARVIS cuts it off mid-sentence. "
+            f"Sensitivity: {sens} — tap to cycle. {_note}")
+
+    def _toggle_barge(self):
+        """Off → medium → low → high → off.
+
+        A four-state cycle on one button rather than a switch plus a slider:
+        sensitivity is the only knob, and it is the kind of thing people try once
+        and then leave alone. Cycling keeps it to a single click.
+        """
+        from memory.config_manager import (get_barge_in_enabled,
+                                           get_barge_in_sensitivity)
+        order = ("medium", "low", "high")
+
+        if not get_barge_in_enabled():
+            want, sens = True, get_barge_in_sensitivity()
+        else:
+            cur = get_barge_in_sensitivity()
+            try:
+                nxt = order[order.index(cur) + 1]
+            except (ValueError, IndexError):
+                nxt = None       # 'high' is the end of the cycle
+            want, sens = (False, cur) if nxt is None else (True, nxt)
+
+        if self.on_barge_toggle:
+            try:
+                self.on_barge_toggle(want, sens)
+            except TypeError:
+                # A handler that only takes the flag — stay compatible.
+                self.on_barge_toggle(want)
+            except Exception as e:
+                self._log.append_log(f"ERR: Voice interrupt failed — {e}")
+
+        self._refresh_barge_btn()
+
+
     def _refresh_hud_btn(self):
         from memory.config_manager import get_hud_style
         face = get_hud_style() == "face"
@@ -5478,6 +5587,44 @@ class MainWindow(QMainWindow):
             ov.deleteLater()
             self._confirm_overlay = None
 
+    # ── Targeting reticle ────────────────────────────────────────────────────
+    # A top-level, click-through window (core/target_overlay.py), not a child of
+    # the central widget like every other overlay here: it draws at screen
+    # coordinates, so it cannot live in the HUD's layout.
+
+    def _show_target_overlay(self, rect, label: str, badge: str,
+                             detail: str, dwell):
+        ov = getattr(self, "_target_overlay", None)
+        if ov is None:
+            try:
+                from core.target_overlay import TargetOverlay
+                ov = TargetOverlay()
+                ov.painted.connect(self._on_target_painted)
+                # Held on self so Qt does not garbage-collect it the moment this
+                # method returns — the same reason _audio_overlay is kept.
+                self._target_overlay = ov
+            except Exception as e:
+                print(f"[UI] target overlay unavailable: {e}")
+                return
+        if rect is None:
+            ov.clear_target()
+            return
+        try:
+            ov.show_target(tuple(rect), label=label, badge=badge,
+                           detail=detail, dwell_ms=dwell)
+        except Exception as e:
+            print(f"[UI] target overlay failed: {e}")
+
+    def _hide_target_overlay(self):
+        ov = getattr(self, "_target_overlay", None)
+        if ov is not None:
+            ov.clear_target()
+
+    def _on_target_painted(self):
+        ev = getattr(self, "_target_painted", None)
+        if ev is not None:
+            ev.set()
+
     def _on_confirm_answered(self, accepted: bool):
         # Tear the banner down first: core.confirm.resolve() may be about to
         # shut the machine down, and a live widget mid-callback is not where you
@@ -5694,6 +5841,10 @@ class JarvisUI:
         _ur.apply_app_font(self._app)
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)
+        # Set before the overlay is ever asked to paint, so a caller waiting on
+        # it always has an Event to wait on.
+        import threading as _th
+        self._target_painted = _th.Event()
         self._win.show()
 
     @property
@@ -5757,6 +5908,44 @@ class JarvisUI:
     def hide_confirm(self) -> None:
         """Thread-safe: take the gate down."""
         self._win._confirm_hide_sig.emit()
+
+    # ── Targeting reticle (core/target_overlay.py) ───────────────────────────
+
+    def show_target(self, rect, label: str = "", badge: str = "",
+                    detail: str = "", dwell_ms: int | None = None) -> None:
+        """Thread-safe: draw the targeting reticle.
+
+        `rect` is a PHYSICAL-pixel (left, top, right, bottom) box — exactly what
+        a `ui_grounding.Candidate` carries and what the accessibility tree, OCR
+        and the vision model all report. The physical-to-logical conversion
+        happens inside the overlay, so callers never have to think about it.
+
+        Returns immediately; the widget is painted on the Qt thread. Call
+        `wait_target_painted()` before clicking if the reticle should be visible
+        first.
+        """
+        self._target_painted = getattr(self, "_target_painted", None)
+        self._win._target_sig.emit(rect, str(label)[:90], str(badge)[:16],
+                                   str(detail)[:60], dwell_ms)
+
+    def hide_target(self) -> None:
+        """Thread-safe: take the reticle down."""
+        self._win._target_hide_sig.emit()
+
+    def wait_target_painted(self, timeout: float = 0.6) -> bool:
+        """Block until the reticle is actually on screen.
+
+        The first paint of a freshly-shown window costs ~18 ms; a later geometry
+        update is under a millisecond. Without waiting, a click can land before
+        the user has seen where it was aimed. Returns False on timeout — a
+        reticle that failed to draw is never a reason to abort the click.
+        """
+        import threading as _th
+        ev = getattr(self, "_target_painted", None)
+        if ev is None:
+            ev = _th.Event()
+            self._target_painted = ev
+        return ev.wait(timeout)
 
     @property
     def get_plugins(self):
@@ -5830,6 +6019,22 @@ class JarvisUI:
     @on_push_to_talk.setter
     def on_push_to_talk(self, cb):
         self._win.on_push_to_talk = cb
+
+    @property
+    def on_barge_toggle(self):
+        return self._win.on_barge_toggle
+
+    @on_barge_toggle.setter
+    def on_barge_toggle(self, cb):
+        self._win.on_barge_toggle = cb
+
+    @property
+    def get_barge_state(self):
+        return self._win.get_barge_state
+
+    @get_barge_state.setter
+    def get_barge_state(self, cb):
+        self._win.get_barge_state = cb
 
     def push_visemes(self, frames, hop: float, at: float) -> None:
         """Thread-safe: post a schedule of (level, openness, width) mouth frames
