@@ -130,6 +130,40 @@ def save_push_to_talk_enabled(enabled: bool) -> None:
     _save_flag("push_to_talk_enabled", enabled)
 
 
+# ── Barge-in ─────────────────────────────────────────────────────────────────
+# Interrupting JARVIS by speaking over it. OFF by default, and deliberately so:
+# how well it works depends on the room, and an assistant that stops mid-sentence
+# at the wrong moment is worse than one you have to wait out. See core/barge_in.py.
+
+BARGE_SENSITIVITIES = ("low", "medium", "high")
+DEFAULT_BARGE_SENSITIVITY = "medium"
+
+
+def get_barge_in_enabled() -> bool:
+    """Whether speaking over JARVIS cuts its reply short."""
+    return load_api_keys().get("barge_in_enabled", False)
+
+
+def save_barge_in_enabled(enabled: bool) -> None:
+    _save_flag("barge_in_enabled", enabled)
+
+
+def get_barge_in_sensitivity() -> str:
+    """How much sustained evidence an interruption needs.
+
+    'low'  — a noisy room or a house with other people in it: harder to trigger.
+    'high' — headphones or a quiet desk: quicker to react.
+    """
+    v = load_api_keys().get("barge_in_sensitivity", DEFAULT_BARGE_SENSITIVITY)
+    return v if v in BARGE_SENSITIVITIES else DEFAULT_BARGE_SENSITIVITY
+
+
+def save_barge_in_sensitivity(value: str) -> None:
+    v = str(value or "").strip().lower()
+    _save_flag("barge_in_sensitivity",
+               v if v in BARGE_SENSITIVITIES else DEFAULT_BARGE_SENSITIVITY)
+
+
 HUD_STYLES = ("face", "core")
 
 
@@ -250,6 +284,106 @@ def get_media_resolution() -> str:
 def save_media_resolution(value: str) -> None:
     v = str(value or "").strip().lower()
     _save_flag("media_resolution", v if v in MEDIA_RESOLUTIONS else "medium")
+
+
+# ── Screen targeting ─────────────────────────────────────────────────────────
+# How JARVIS turns "click the Save button" into a pixel. The defaults are the
+# ones that make a click land exactly, and each can be turned off by someone who
+# would rather trade accuracy for speed or privacy.
+
+GROUNDING_LAYERS = ("uia", "ocr", "vision")
+
+
+def get_grounding_layers() -> tuple[str, ...]:
+    """Which targeting layers may be used, cheapest first.
+
+    "uia" reads the Windows accessibility tree — no model call, ~10-40 ms, and
+    pixel-exact because Windows computed the rectangle itself. "ocr" reads the
+    visible text, which covers Electron, Chrome and games that the tree cannot
+    see. "vision" asks a model, and is the slow, approximate last resort.
+
+    An empty or invalid setting falls back to all three; a layer that is not
+    installed is skipped at run time regardless of what is listed here.
+    """
+    raw = load_api_keys().get("grounding_layers", None)
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return GROUNDING_LAYERS
+    keep = tuple(str(v).strip().lower() for v in raw
+                 if str(v).strip().lower() in GROUNDING_LAYERS)
+    return keep or GROUNDING_LAYERS
+
+
+def save_grounding_layers(layers) -> None:
+    if not isinstance(layers, (list, tuple)):
+        layers = GROUNDING_LAYERS
+    keep = [str(v).strip().lower() for v in layers
+            if str(v).strip().lower() in GROUNDING_LAYERS]
+    _patch_config(grounding_layers=keep or list(GROUNDING_LAYERS))
+
+
+def get_overlay_enabled() -> bool:
+    """Whether the targeting reticle is drawn before a click. On by default:
+    an assistant that moves the mouse should show you where first."""
+    return bool(load_api_keys().get("overlay_enabled", True))
+
+
+def save_overlay_enabled(enabled: bool) -> None:
+    _save_flag("overlay_enabled", enabled)
+
+
+def get_overlay_dwell_ms() -> int:
+    """How long the reticle stays up when a caller does not specify, in ms."""
+    try:
+        v = int(load_api_keys().get("overlay_dwell_ms", 1400))
+    except (TypeError, ValueError):
+        v = 1400
+    return max(0, min(v, 10_000))
+
+
+def save_overlay_dwell_ms(ms: int) -> None:
+    try:
+        v = max(0, min(int(ms), 10_000))
+    except (TypeError, ValueError):
+        v = 1400
+    _patch_config(overlay_dwell_ms=v)
+
+
+def get_cursor_in_capture() -> bool:
+    """Whether screenshots include the mouse pointer. On by default: without it
+    the model cannot see where the cursor is, which makes any instruction
+    relative to it impossible to act on."""
+    return bool(load_api_keys().get("cursor_in_capture", True))
+
+
+def save_cursor_in_capture(enabled: bool) -> None:
+    _save_flag("cursor_in_capture", enabled)
+
+
+def get_click_verify() -> bool:
+    """Whether a click is checked by comparing the screen before and after.
+    On by default: it is what turns a silent miss into a reported failure."""
+    return bool(load_api_keys().get("click_verify", True))
+
+
+def save_click_verify(enabled: bool) -> None:
+    _save_flag("click_verify", enabled)
+
+
+def get_agent_max_steps() -> int:
+    """Ceiling on how many actions an autonomous run may take."""
+    try:
+        v = int(load_api_keys().get("agent_max_steps", 12))
+    except (TypeError, ValueError):
+        v = 12
+    return max(1, min(v, 40))
+
+
+def save_agent_max_steps(steps: int) -> None:
+    try:
+        v = max(1, min(int(steps), 40))
+    except (TypeError, ValueError):
+        v = 12
+    _patch_config(agent_max_steps=v)
 
 
 def _save_flag(key: str, value) -> None:
