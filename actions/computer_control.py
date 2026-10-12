@@ -1,8 +1,6 @@
 #computer_control.py
-import io
 import json
 import platform
-import re
 import string
 import subprocess
 import sys
@@ -318,63 +316,307 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
-def _screen_find(description: str) -> tuple[int, int] | None:
-    """Ask Gemini for a normalized 0-1000 box (its native grounding format),
-    then convert to real screen pixels. Raw-pixel answers are unreliable."""
-    if not _get_api_key():
-        print("[ComputerControl] ⚠️ No API key for screen_find")
+def _grounding():
+    """The targeting layer, imported on use.
+
+    Deferred so this module can be imported (by the action loader, at startup)
+    without pulling in PyQt6 or the OCR engine, and so the coordinate layer is
+    never loaded before DPI awareness has been declared.
+    """
+    from core import ui_grounding
+    return ui_grounding
+
+
+def _screen_find(description: str, window: str | None = None):
+    """Find an element and return its best (x, y) in physical pixels.
+
+    This replaces a version that asked a vision model for a normalised box on
+    every single call, trusted whatever came back, and clicked. Three things
+    were wrong with that and all three are fixed here:
+
+    * The answer was never validated. A model replying in pixels, or in 0-1
+      fractions, produced a coordinate that looked plausible and was wrong.
+      `ui_grounding.parse_box` now infers the unit and rejects what it cannot
+      place.
+    * It was slow and cost a model call per click. The accessibility tree
+      answers in ~10-40 ms with a rectangle Windows computed itself, and OCR
+      covers the apps the tree cannot see — so the model is now the last resort
+      rather than the only option.
+    * Only the box centre survived, so nothing downstream could verify the click
+      or draw the target. The whole `Candidate` is returned now.
+
+    Returns a `Candidate`, or None when nothing could find the element.
+    """
+    try:
+        return _grounding().resolve_one(description, window=window)
+    except Exception as e:
+        print(f"[ComputerControl] screen_find failed: {e}")
         return None
 
+
+def _screen_candidates(description: str, window: str | None = None) -> list:
+    """Every place the targeting layer thinks the element might be, best first.
+
+    `_screen_find` throws all but the winner away, and the winner is sometimes
+    the wrong one — the vision layer asked for a contact row and answered with
+    the row above it. `resolve()` already returns the full list precisely so a
+    caller can try, verify and move on; this is the caller doing that.
+    """
     try:
-        from google.genai import types as gtypes
-
-        _require_pyautogui()
-        sw, sh = pyautogui.size()
-        img    = pyautogui.screenshot()
-        # Normalized coords don't care about resolution, so shrink the upload:
-        # a 4K PNG is slow and expensive for no gain in accuracy.
-        if img.width > 1600:
-            img = img.resize((1600, round(img.height * 1600 / img.width)))
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=85)
-        image_bytes = buf.getvalue()
-
-        prompt = (
-            f"Locate the UI element described as: '{description}'. "
-            "Reply with ONLY a JSON object: {\"box_2d\": [ymin, xmin, ymax, xmax]} "
-            "with coordinates normalized to 0-1000 "
-            "(0,0 = top-left of the screenshot, 1000,1000 = bottom-right). "
-            "If the element is not visible, reply exactly: NOT_FOUND"
-        )
-
-        from core import gemini
-        # An explicit model name as `tier` is tried FIRST (see gemini.call). The
-        # default FAST ladder leads with a Live voice model, which is the wrong
-        # tool for pointing at pixels; gemini-2.5-flash is good at boxes.
-        response = gemini.call(
-            [gtypes.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"), prompt],
-            tier="gemini-2.5-flash", timeout_ms=20_000,
-        )
-        if response is None:
-            return None
-
-        text = (response.text or "").strip()
-        if "NOT_FOUND" in text.upper():
-            return None
-
-        m = re.search(
-            r"\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,"
-            r"\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]", text)
-        if m:
-            ymin, xmin, ymax, xmax = (float(g) for g in m.groups())
-            x = int((xmin + xmax) / 2000 * sw)
-            y = int((ymin + ymax) / 2000 * sh)
-            return max(0, min(sw - 1, x)), max(0, min(sh - 1, y))
-
+        return _grounding().resolve(description, window=window)
     except Exception as e:
-        print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
+        print(f"[ComputerControl] screen_candidates failed: {e}")
+        return []
 
-    return None
+
+def _hwnd_for_window(title_fragment: str) -> int:
+    """The HWND of the first visible window whose title contains the fragment.
+
+    Kept separate from `region_for_window` because raising a window needs the
+    handle, not its rectangle, and the two are looked up from different sources.
+    """
+    if not title_fragment:
+        return 0
+    try:
+        from core import ui_grounding
+        for w in ui_grounding._visible_top_windows(limit=20):
+            try:
+                name = str(w.Name or "")
+                if title_fragment.lower() in name.lower():
+                    hwnd = ui_grounding.window_handle(w)
+                    if hwnd:
+                        return hwnd
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        import pygetwindow as gw
+        for w in gw.getAllWindows():
+            if title_fragment.lower() in (w.title or "").lower() and w.visible:
+                return int(w._hWnd)
+    except Exception:
+        pass
+    return 0
+
+
+# Below this, a candidate is a guess rather than a location. Only the vision
+# layer produces them, and only when its two passes disagreed.
+_WEAK_CONF = 0.5
+# How many candidates a single click will try before giving up. Small on
+# purpose: the point is to recover from one wrong winner, not to click around
+# the screen looking for something that is not there.
+_MAX_ATTEMPTS = 3
+
+
+def _attemptable(candidates: list) -> list:
+    """The candidates worth actually clicking, best first.
+
+    A verified click is cheap when it works and expensive when it does not — it
+    costs a pause, a click and a screen comparison each time — so a run only
+    walks as far as the candidates are plausible. Everything the UIA and OCR
+    layers produce is exact enough to try; the vision layer's unconfirmed
+    guesses are tried only when nothing better exists, because clicking a
+    point that neither of its two passes agreed on is the behaviour that
+    produced the misclicks in the first place.
+    """
+    strong = [c for c in candidates if c.confidence >= _WEAK_CONF]
+    if strong:
+        return strong[:_MAX_ATTEMPTS]
+    return candidates[:_MAX_ATTEMPTS]
+
+
+def _corroborate(description: str, candidates: list, window: str | None) -> list:
+    """Give a weak candidate one cheap chance to be confirmed or replaced.
+
+    The vision layer can return a low-confidence box — its coarse and fine looks
+    disagreed. Rather than click it and find out, ask the accessibility tree
+    again, which costs about forty milliseconds and no API call. If the tree
+    knows a control matching the description, that answer is pixel-exact and
+    replaces the guess outright; if it does not, the guess stands, because
+    unreadable UI (Electron, canvas) is precisely why the vision layer exists.
+
+    Returns the list unchanged when there is nothing weak in it, which is the
+    common case.
+    """
+    if not candidates or candidates[0].confidence >= _WEAK_CONF:
+        return candidates
+    try:
+        from core import ui_grounding
+        exact = ui_grounding.find_by_uia(description, window=window)
+    except Exception as e:
+        print(f"[ComputerControl] corroboration failed: {e}")
+        return candidates
+    if not exact:
+        return candidates
+    print(f"[ComputerControl] '{description}': the vision guess at "
+          f"({candidates[0].x},{candidates[0].y}) conf={candidates[0].confidence:.2f} "
+          f"was replaced by an exact match {exact[0].label!r} at "
+          f"({exact[0].x},{exact[0].y})")
+    # The exact hits first, then whatever else was offered, so the retry loop
+    # still has the vision reading to fall back on.
+    seen = {(c.x, c.y) for c in exact}
+    return exact + [c for c in candidates if (c.x, c.y) not in seen]
+
+
+def _screen_click(description: str, button: str = "left", clicks: int = 1,
+                  player=None, verify: bool = True, window: str | None = None) -> str:
+    """Find an element, show where it is, click it, and check it worked.
+
+    The reticle is drawn before the click so a wrong target is visible rather
+    than surprising, and the screen is compared afterwards so a click that
+    silently missed is reported as a failure instead of as success.
+    """
+    from core import screen_geometry as sg
+
+    candidates = _screen_candidates(description, window=window)
+    if not candidates:
+        return f"Element not found on screen: '{description}'"
+
+    # A weak candidate is a guess, and a guess is worth confirming before the
+    # click rather than after it. Only the vision layer produces weak ones, and
+    # only when its two passes disagreed — see `find_by_vision`. A cheap UIA
+    # re-walk costs ~40 ms and either rules the guess out or promotes it.
+    candidates = _corroborate(description, candidates, window)
+
+    # Raise the window the element belongs to before clicking it.
+    #
+    # A click is delivered to whatever window is under the cursor, but a click
+    # into a window that is behind another one — or that is not the foreground
+    # window at all — often does not register as a real interaction. The
+    # targeting layer reports which window it found the element in, so that
+    # window is brought forward first. Skipping this is why a click can land
+    # exactly on a button and still do nothing.
+    raised = False
+    first = candidates[0]
+    if first.window:
+        try:
+            from core import ui_grounding
+            hwnd = _hwnd_for_window(first.window)
+            if hwnd:
+                raised = ui_grounding.force_foreground(hwnd)
+                if raised:
+                    # Let the raise settle before the click. A window that is
+                    # still animating into the foreground can move the element
+                    # out from under a coordinate resolved a moment ago.
+                    time.sleep(0.15)
+        except Exception:
+            raised = False
+
+    # Try the candidates in order, and let the screen decide.
+    #
+    # This used to click the single best candidate and report failure if nothing
+    # changed — so when the winner was wrong, the run ended there even though the
+    # layer had already offered the right answer second. That is how a request
+    # for one contact row clicked the row above it and then simply stopped.
+    # Verification exists; it was just never given a second thing to try.
+    #
+    # At most three are attempted, and only candidates the layer has real
+    # confidence in, so a genuinely absent element still fails in bounded time
+    # rather than clicking its way around the screen.
+    attempts = _attemptable(candidates)
+    last: tuple | None = None
+
+    for index, cand in enumerate(attempts):
+        # Show the target before acting on it.
+        if player is not None:
+            try:
+                player.show_target(cand.rect, label=description,
+                                   detail=f"via {cand.source}", dwell_ms=1200)
+                if hasattr(player, "wait_target_painted"):
+                    player.wait_target_painted(0.4)
+            except Exception:
+                pass
+
+        # Watch both the click's neighbourhood and the window it sits in. The
+        # local region alone is too narrow — a click on a "+" button changes a
+        # label elsewhere in the window, and scoring that as a miss would be
+        # wrong. The window region alone is too loose, so the two are checked
+        # together and the result says which one moved.
+        watch = None
+        if verify:
+            pad = 70
+            l, t, r, b = cand.rect
+            local = (max(0, l - pad), max(0, t - pad),
+                     (r - l) + pad * 2, (b - t) + pad * 2)
+            watch = sg.watch_for(local)
+            watch.snapshot()
+
+        time.sleep(0.12)
+        _click(x=cand.x, y=cand.y, button=button, clicks=clicks)
+
+        if player is not None:
+            try:
+                player.hide_target()
+            except Exception:
+                pass
+
+        if watch is None:
+            return (f"Clicked '{description}' at ({cand.x}, {cand.y}) "
+                    f"[{cand.source}] — found via {cand.label!r}")
+
+        changed, frac, where = watch.changed()
+        if changed:
+            # A percentage for a large change, nothing for a small one: a single
+            # character changing is well under 0.1% and would read as "0.0%",
+            # which looks like a failure.
+            pct = f" ({frac * 100:.0f}%)" if frac >= 0.01 else ""
+            tried = (f" (after {index} earlier miss"
+                     f"{'es' if index != 1 else ''})" if index else "")
+            return (f"Clicked '{description}' at ({cand.x}, {cand.y}) "
+                    f"[{cand.source}] — screen changed {where}{pct}{tried}")
+        last = (cand, watch)
+        if index + 1 < len(attempts):
+            print(f"[ComputerControl] '{description}': nothing changed after "
+                  f"clicking {cand.label!r} at ({cand.x},{cand.y}), trying the "
+                  f"next candidate")
+
+    cand, _ = last
+    raised_note = "" if raised or not cand.window else \
+        f" (could not raise '{cand.window}', so the click may not register)"
+    extra = (f"; {len(attempts) - 1} other candidate"
+             f"{'s' if len(attempts) != 2 else ''} tried too" if len(attempts) > 1
+             else "")
+    return (f"Clicked '{description}' at ({cand.x}, {cand.y}) "
+            f"[{cand.source}] — but NOTHING CHANGED on screen, so the click may "
+            f"have missed{extra}{raised_note}; "
+            f"the element found was {cand.label!r}")
+
+
+def _screen_drag(from_desc: str, to_desc: str, player=None) -> str:
+    """Drag one on-screen element onto another.
+
+    Both ends are found the same way a click target is, which is what makes this
+    work on a target the user names rather than on raw coordinates they would
+    have to know.
+    """
+    from core import screen_geometry as sg
+
+    src = _screen_find(from_desc)
+    if src is None:
+        return f"Drag source not found: '{from_desc}'"
+    dst = _screen_find(to_desc)
+    if dst is None:
+        return f"Drag destination not found: '{to_desc}'"
+
+    if player is not None:
+        try:
+            player.show_target(src.rect, label=f"drag {from_desc}",
+                               detail=f"to {to_desc}", dwell_ms=1200)
+            if hasattr(player, "wait_target_painted"):
+                player.wait_target_painted(0.4)
+        except Exception:
+            pass
+
+    time.sleep(0.12)
+    result = _drag(src.x, src.y, dst.x, dst.y)
+
+    if player is not None:
+        try:
+            player.hide_target()
+        except Exception:
+            pass
+    return f"{result} — '{from_desc}' [{src.source}] → '{to_desc}' [{dst.source}]"
 
 def computer_control(
     parameters: dict,
@@ -397,6 +639,10 @@ def computer_control(
       seconds       : wait duration
       title         : window title fragment for focus_window
       description   : natural-language element description for screen_find/click
+      to_description: drag destination description for screen_drag
+      goal          : what to accomplish, for screen_agent
+      max_steps     : step ceiling for screen_agent (default 12)
+      dry_run       : bool, plan and aim but do not click (screen_agent)
       type          : data type for random_data
       field         : memory field name for user_data
       clear_first   : bool, clear field before typing (default: true)
@@ -419,8 +665,12 @@ def computer_control(
       wait          — sleep N seconds
       clear_field   — select-all + delete
       focus_window  — bring window to foreground
-      screen_find   — AI element finder (returns x,y)
-      screen_click  — AI element finder + click
+      cursor_pos    — where the mouse is right now
+      screen_find   — find an element (returns x,y)
+      screen_click  — find an element, show it, click it, verify it worked
+      screen_drag   — drag one named element onto another
+      screen_verify — find an element without clicking, to check it exists
+      screen_agent  — pursue a goal autonomously, verifying each step
       random_data   — generate fake form data
       user_data     — pull real data from memory
     """
@@ -487,18 +737,65 @@ def computer_control(
         if action == "screenshot":
             return _screenshot(params.get("path"))
 
+        if action == "cursor_pos":
+            from core import screen_geometry as sg
+            x, y = sg.cursor_pos()
+            return f"Mouse is at ({x}, {y})"
+
         if action == "screen_find":
-            coords = _screen_find(params.get("description", ""))
-            return f"{coords[0]},{coords[1]}" if coords else "NOT_FOUND"
+            cand = _screen_find(params.get("description", ""),
+                                window=params.get("window") or None)
+            if cand is None:
+                return "NOT_FOUND"
+            return f"{cand.x},{cand.y}"
+
+        if action == "screen_verify":
+            desc = params.get("description", "")
+            cand = _screen_find(desc, window=params.get("window") or None)
+            if cand is None:
+                return f"'{desc}' is NOT on screen."
+            return (f"'{desc}' is on screen at ({cand.x}, {cand.y}), "
+                    f"found as {cand.label!r} via {cand.source} "
+                    f"(confidence {cand.confidence:.2f}).")
 
         if action == "screen_click":
-            desc   = params.get("description", "")
-            coords = _screen_find(desc)
-            if coords:
-                time.sleep(0.2)
-                _click(x=coords[0], y=coords[1])
-                return f"Clicked '{desc}' at {coords}"
-            return f"Element not found on screen: '{desc}'"
+            return _screen_click(
+                params.get("description", ""),
+                button=params.get("button", "left"),
+                clicks=2 if params.get("clicks") == 2 else 1,
+                player=player,
+                verify=params.get("verify", True) is not False,
+                window=params.get("window") or None,
+            )
+
+        if action == "screen_drag":
+            return _screen_drag(
+                params.get("description", ""),
+                params.get("to_description", ""),
+                player=player,
+            )
+
+        if action == "screen_agent":
+            goal = params.get("goal", "") or params.get("description", "")
+            if not goal:
+                return "screen_agent needs a 'goal' describing what to accomplish."
+            from core import screen_agent
+            ok, why = screen_agent.available()
+            if not ok:
+                return f"Cannot run the screen agent: {why}"
+            try:
+                max_steps = int(params.get("max_steps", screen_agent.DEFAULT_MAX_STEPS))
+            except (TypeError, ValueError):
+                max_steps = screen_agent.DEFAULT_MAX_STEPS
+            run = screen_agent.run(
+                goal,
+                max_steps=max(1, min(max_steps, 40)),
+                dry_run=bool(params.get("dry_run", False)),
+                show_overlay=params.get("show_overlay", True) is not False,
+                player=player,
+                log=(lambda m: player.write_log(f"[Agent] {m}")) if player else None,
+            )
+            return run.summary()
 
         if action == "wait":
             secs = float(params.get("seconds", 1.0))
@@ -543,7 +840,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"
+                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | cursor_pos | screen_find | screen_click | screen_drag | screen_verify | screen_agent | random_data | user_data"
             },
             "text": {
                 "type": "STRING",
@@ -583,7 +880,31 @@ TOOL = {
             },
             "description": {
                 "type": "STRING",
-                "description": "Element description for screen_find/screen_click"
+                "description": "Element description for screen_find/screen_click/screen_drag/screen_verify. Use the element's exact visible label or accessibility name, e.g. 'Save', 'File menu'."
+            },
+            "to_description": {
+                "type": "STRING",
+                "description": "Where to drag to, for screen_drag"
+            },
+            "goal": {
+                "type": "STRING",
+                "description": "What to accomplish, for screen_agent — a task like 'open Notepad and type hello', not a single click"
+            },
+            "max_steps": {
+                "type": "INTEGER",
+                "description": "Step ceiling for screen_agent (default 12, max 40)"
+            },
+            "dry_run": {
+                "type": "BOOLEAN",
+                "description": "For screen_agent: plan and aim at each target but do not click. Use to show the user what it would do first."
+            },
+            "window": {
+                "type": "STRING",
+                "description": "Optional window title fragment to search within, for screen_find/click/verify. Narrows the search and avoids matching the same word in another window."
+            },
+            "verify": {
+                "type": "BOOLEAN",
+                "description": "For screen_click: check the screen changed after clicking (default true)"
             },
             "type": {
                 "type": "STRING",
