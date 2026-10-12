@@ -173,6 +173,22 @@ class EchoGuard:
         """1.0 = fully explained by our own output, 0.0 = nothing to do with it."""
         return self._last_sim
 
+    @property
+    def has_reference(self) -> bool:
+        """True when there is recent output to compare the microphone against.
+
+        `is_user_speech()` answers "True" when the history is empty, and that is
+        the right answer for the echo *tail* — nothing was playing, so anything
+        audible is the user. It is the wrong answer for barge-in, where the
+        question is whether to cut off a reply that is currently being spoken:
+        in the block or two before the playback loop has recorded anything, an
+        empty history would let the guard call our own first syllable a voice and
+        the assistant would interrupt itself.
+
+        Callers that need "is this *definitely* someone else" check this first.
+        """
+        return bool(self._hist)
+
     def reset(self) -> None:
         """Playback stopped — drop the history, keep what was learned."""
         self._hist.clear()

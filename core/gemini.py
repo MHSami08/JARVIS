@@ -207,7 +207,20 @@ DEFAULT_TIMEOUT_MS = 10_000
 MIN_TIMEOUT_MS = 10_000
 
 _key_lock = threading.Lock()
-_cached_key: str | None = None
+_cached_keys: list[str] | None = None
+
+# Keys that are known bad — rejected as invalid, or not permitted. Separate from
+# the model cooldown below because it is a different fact with a different
+# consequence: a model resting is skipped for one key, whereas a dead key is
+# skipped for every model, and when there is no other key left the honest answer
+# is to ask the user for one rather than to keep reconnecting into the same wall.
+_dead_keys: dict[str, float] = {}
+_dead_lock = threading.Lock()
+
+# How long a rejected key is set aside before it is tried again. Short, because
+# the usual cause is a typo the user is about to fix, and the fix is meant to be
+# picked up without a restart.
+_DEAD_KEY_SECONDS = 10 * 60
 
 # A rung that answered 429 is out of quota, and on the free tier it will stay
 # that way for a while. Retrying it on every single call is a wasted round trip
@@ -266,13 +279,38 @@ def live_model() -> str:
     return LIVE_MODELS[0]
 
 
-def note_live_failure(model: str, err: str) -> bool:
+def is_key_error(err: str) -> bool:
+    """The key itself is the problem — not the model, and not the network.
+
+    Worth its own case because the remedy is different in kind: every other
+    failure here is answered by moving along a ladder, and this one is answered
+    by asking the user for a new key. Retrying it against each model in turn
+    reaches the same wall repeatedly and, worse, makes a bad key look like a bad
+    model in the log.
+    """
+    low = err.lower()
+    return ("api key not valid" in low
+            or "api_key_invalid" in low
+            or "api key expired" in low
+            or "invalid api key" in low
+            or "permission_denied" in low and "key" in low)
+
+
+def note_live_failure(model: str, err: str, key: str = "") -> bool:
     """Record why a Live model failed. True when it is worth trying the next.
 
-    Only quota and availability move the ladder along. A bad API key or a
-    dropped network is not the model's fault, and stepping down the ladder for
-    those would work through every model and reach the same wall four times.
+    Only quota and availability move the ladder along. A dropped network is not
+    the model's fault, and stepping down the ladder for it would work through
+    every model and reach the same wall four times.
+
+    A rejected KEY does move the ladder along — but along the key ladder rather
+    than the model one, which is what `key` is for. It is recorded against the
+    key so the next call reaches for a spare, and the model is left alone: the
+    model did nothing wrong.
     """
+    if is_key_error(err):
+        _mark_key_dead(key, "the API rejected it")
+        return True
     if is_quota_error(err):
         _cool(model, _COOLDOWN_SECONDS)
         print(f"[Gemini] Live model {model} is out of quota — "
@@ -295,18 +333,100 @@ def _cooling(model: str) -> bool:
         return False
 
 
-def api_key(refresh: bool = False) -> str:
-    """The Gemini key from config/api_keys.json. Cached; never raises."""
-    global _cached_key
+def api_keys(refresh: bool = False) -> list[str]:
+    """Every Gemini key configured, in the order to try them.
+
+    The file holds one key in `gemini_api_key` and any spares in
+    `gemini_api_keys`; the UI's setup screen writes both (see
+    MainWindow._on_setup_done). Flattened here into one ladder so the rest of
+    the app never has to know the file has two spellings for the same thing.
+    Duplicates are dropped and blanks skipped, because a hand-edited file
+    readily ends up with both.
+
+    Cached; never raises. Pass refresh=True after the user saves a new key.
+    """
+    global _cached_keys
     with _key_lock:
-        if _cached_key is not None and not refresh:
-            return _cached_key
+        if _cached_keys is not None and not refresh:
+            return list(_cached_keys)
+        out: list[str] = []
         try:
             data = json.loads(_KEY_FILE.read_text(encoding="utf-8"))
-            _cached_key = str(data.get("gemini_api_key") or "")
+            raw = [data.get("gemini_api_key"), data.get("gemini_api_keys")]
+            for item in raw:
+                values = item if isinstance(item, (list, tuple)) else [item]
+                for value in values:
+                    for piece in str(value or "").replace(",", " ").split():
+                        if piece and piece not in out:
+                            out.append(piece)
         except Exception:
-            _cached_key = ""
-        return _cached_key
+            out = []
+        _cached_keys = out
+        return list(out)
+
+
+def key_label(key: str) -> str:
+    """A short, non-revealing name for a key, for the log and the UI.
+
+    Never the key itself: this string is printed at every connect and shown in
+    the activity log, and the whole point of the ladder is that the log stays
+    safe to paste into a bug report. First four and last four characters are
+    enough to tell two keys apart by eye.
+    """
+    key = (key or "").strip()
+    if not key:
+        return "none"
+    if len(key) <= 12:
+        return key[:2] + "…"
+    return f"{key[:4]}…{key[-4:]}"
+
+
+def api_key(refresh: bool = False) -> str:
+    """The key to use right now: the first configured one that is not set aside.
+
+    Kept as a single string for the call sites that only ever need one — the
+    one-shot calls in this module and in the actions. Falls back to the first
+    configured key when every one has been rejected, so behaviour is unchanged
+    for the ordinary single-key install.
+    """
+    keys = api_keys(refresh=refresh)
+    for k in keys:
+        if not _key_dead(k):
+            return k
+    return keys[0] if keys else ""
+
+
+def _key_dead(key: str) -> bool:
+    with _dead_lock:
+        until = _dead_keys.get(key, 0.0)
+        if until and time.monotonic() < until:
+            return True
+        _dead_keys.pop(key, None)
+        return False
+
+
+def _mark_key_dead(key: str, reason: str = "") -> None:
+    if not key:
+        return
+    with _dead_lock:
+        _dead_keys[key] = time.monotonic() + _DEAD_KEY_SECONDS
+    if reason:
+        print(f"[Gemini] Key {key_label(key)} set aside: {reason}")
+
+
+def live_target() -> tuple[str, str]:
+    """(key, model) to open the conversation with — the rung of both ladders.
+
+    Returned together because the two are chosen by the same rule and are only
+    meaningful as a pair: main.py publishes the model back to LIVE_MODEL so
+    plugins follow whatever is actually running. When every key has been
+    rejected the first one is returned anyway; refusing to connect at all is
+    never the better answer, and the connect loop reports the failure.
+    """
+    key = api_key()
+    if not key:
+        return "", live_model()
+    return key, live_model()
 
 
 def client(timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = ""):
@@ -505,6 +625,16 @@ def call(contents, tier: str = FAST, config=None,
             return cl.models.generate_content(**kwargs)
         except Exception as e:
             msg = str(e)
+            if is_key_error(msg):
+                # The key, not the model. Retrying the rest of the ladder with
+                # it reaches the same wall once per rung, so stop here and let
+                # the caller's default stand. Reported rather than silent: this
+                # is the one failure the user has to act on themselves.
+                _mark_key_dead(resolved_key, "the API rejected it")
+                print(f"[Gemini] key {key_label(resolved_key)} was rejected — "
+                      f"the feature behind this call is unavailable until a "
+                      f"valid key is configured")
+                return None
             if is_quota_error(msg):
                 _cool(model)
                 print(f"[Gemini] {model}: out of quota — skipping it for "
