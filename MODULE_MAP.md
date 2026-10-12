@@ -246,9 +246,7 @@ directly by `main.py`.
 |---|---|---|
 | `file_access.py` | `manage_file_access` | `run(parameters, …)` |
 | `file_navigator.py` | `file_navigator` | `run(parameters, …)` |
-| `self_dev.py` | `jarvis_self_developer` | `run(parameters, response, player, session_memory)` |
 | `temp_cleaner.py` | `temp_cleaner` | `run(parameters, …)` |
-| `self_modification_system.py` | (writes core files) | `run(parameters, response, player, session_memory)` |
 
 Plugins reach into `core.confirm`, `core.gemini`, `memory.config_manager`
 (`load_api_keys`, `_patch_config`), and — for the self-modification pair —
