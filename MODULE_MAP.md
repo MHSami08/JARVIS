@@ -213,6 +213,7 @@ Each file exposes a `TOOL` dict. Verified tool names:
 | `file_processor.py` | `file_processor` | `file_processor` |
 | `flight_finder.py` | `flight_finder` | `flight_finder` |
 | `game_updater.py` | `game_updater` | `game_updater` |
+| `google_workspace.py` | `google_workspace` | `google_workspace` |
 | `open_app.py` | `open_app` | `open_app` |
 | `reminder.py` | `reminder` | `reminder` |
 | `send_message.py` | `send_message` | `send_message` |
