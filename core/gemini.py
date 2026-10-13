@@ -22,7 +22,6 @@ WHY THIS EXISTS
 
     NO SINGLE PLACE TO CHANGE.  A new model release meant editing sixteen files
     and hoping none were missed.
-
 THE LIVE MODEL DOES THIS WORK, AND IT LEADS THE LADDER
     Not the user's conversation — a separate, throwaway session per call, so
     nothing a plugin asks is ever heard by the person at the microphone.
@@ -236,13 +235,16 @@ _GONE_SECONDS = 6 * 60 * 60
 # Overloaded or timing out. Usually passes, so a shorter rest than "gone" —
 # but long enough that the fourteen-second wait is paid once, not repeatedly.
 _UNAVAILABLE_SECONDS = 30 * 60
-_cooldown: dict[str, float] = {}
+# Keyed (key, model). Quota is per key, so a 429 rests that pair only and the
+# same model is still tried on the next key. key "" means every key: a model
+# that is gone or timing out is down for all of them.
+_cooldown: dict[tuple[str, str], float] = {}
 _cool_lock = threading.Lock()
 
 
-def _cool(model: str, seconds: float = _COOLDOWN_SECONDS) -> None:
+def _cool(model: str, seconds: float = _COOLDOWN_SECONDS, key: str = "") -> None:
     with _cool_lock:
-        _cooldown[model] = time.monotonic() + seconds
+        _cooldown[(key, model)] = time.monotonic() + seconds
 
 
 def is_quota_error(err: str) -> bool:
@@ -269,12 +271,13 @@ def is_gone_error(err: str) -> bool:
             or "permission" in low or "403" in err)
 
 
-def live_model() -> str:
+def live_model(key: str = "") -> str:
     """The Live model to open the conversation with: the first rung that is not
-    resting. If every one is resting the ladder is used from the top anyway —
-    refusing to connect at all is never the better answer."""
+    resting (for `key`, when given). If every one is resting the ladder is used
+    from the top anyway — refusing to connect at all is never the better
+    answer."""
     for m in LIVE_MODELS:
-        if not _cooling(m):
+        if not _cooling(m, key):
             return m
     return LIVE_MODELS[0]
 
@@ -312,9 +315,9 @@ def note_live_failure(model: str, err: str, key: str = "") -> bool:
         _mark_key_dead(key, "the API rejected it")
         return True
     if is_quota_error(err):
-        _cool(model, _COOLDOWN_SECONDS)
-        print(f"[Gemini] Live model {model} is out of quota — "
-              f"switching for {_COOLDOWN_SECONDS // 60} minutes.")
+        _cool(model, _COOLDOWN_SECONDS, key)
+        print(f"[Gemini] Live model {model} is out of quota on key "
+              f"{key_label(key)} — switching for {_COOLDOWN_SECONDS // 60} minutes.")
         return True
     if is_gone_error(err):
         _cool(model, _GONE_SECONDS)
@@ -324,12 +327,14 @@ def note_live_failure(model: str, err: str, key: str = "") -> bool:
     return False
 
 
-def _cooling(model: str) -> bool:
+def _cooling(model: str, key: str = "") -> bool:
     with _cool_lock:
-        until = _cooldown.get(model, 0.0)
-        if until and time.monotonic() < until:
-            return True
-        _cooldown.pop(model, None)
+        now = time.monotonic()
+        for k in {key, ""}:
+            until = _cooldown.get((k, model), 0.0)
+            if until and now < until:
+                return True
+            _cooldown.pop((k, model), None)
         return False
 
 
@@ -363,6 +368,19 @@ def api_keys(refresh: bool = False) -> list[str]:
             out = []
         _cached_keys = out
         return list(out)
+
+
+def _raw_config() -> dict:
+    """The whole key file (fallback provider keys live here). Never raises."""
+    try:
+        return json.loads(_KEY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _has_fallback() -> bool:
+    cfg = _raw_config()
+    return any(cfg.get(f"{p}_api_key") for p in ("groq", "openrouter"))
 
 
 def key_label(key: str) -> str:
@@ -423,10 +441,14 @@ def live_target() -> tuple[str, str]:
     rejected the first one is returned anyway; refusing to connect at all is
     never the better answer, and the connect loop reports the failure.
     """
-    key = api_key()
-    if not key:
+    keys = [k for k in api_keys() if not _key_dead(k)] or api_keys()
+    if not keys:
         return "", live_model()
-    return key, live_model()
+    for m in LIVE_MODELS:                 # prefer the better model, any key
+        for k in keys:
+            if not _cooling(m, k):
+                return k, m
+    return keys[0], LIVE_MODELS[0]
 
 
 def client(timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = ""):
@@ -603,42 +625,45 @@ def call(contents, tier: str = FAST, config=None,
     if ladder is None:
         ladder = (tier,) + tuple(m for m in _LADDERS[SMART] if m != tier)
 
-    resolved_key = key or api_key()
-    if not resolved_key:
+    # Key pool: an explicit `key` goes first, then every configured spare.
+    # Rotation order is model-outer, key-inner, so the fastest model gets to
+    # use every key's quota before the ladder steps down to a slower one.
+    keys = [k for k in dict.fromkeys(([key] if key else []) + api_keys())]
+    if not keys:
         print("[Gemini] no Gemini API key is configured")
-        return None
+    pairs = [(m, k) for m in ladder for k in keys]
+    # Skip resting pairs — unless everything is resting, then try them anyway.
+    skip_resting = any(not _cooling(m, k) for m, k in pairs)
+    if not skip_resting and _has_fallback():
+        pairs = []          # all Gemini pairs resting and a fallback exists: go straight to it
 
-    cl = None
-    tried = [m for m in ladder if not _cooling(m)] or list(ladder)
-    for model in tried:
+    clients: dict[str, object] = {}
+    for model, k in pairs:
+        if _key_dead(k) or (skip_resting and _cooling(model, k)):
+            continue
         try:
             if model == LIVE:
-                reply = _live_call(contents, config, timeout_ms, resolved_key)
+                reply = _live_call(contents, config, timeout_ms, k)
                 if reply is not None:
                     return reply
                 raise RuntimeError("the Live turn came back empty")
-            if cl is None:
-                cl = client(timeout_ms=timeout_ms, key=resolved_key)
+            if k not in clients:
+                clients[k] = client(timeout_ms=timeout_ms, key=k)
             kwargs = {"model": model, "contents": contents}
             if config is not None:
                 kwargs["config"] = config
-            return cl.models.generate_content(**kwargs)
+            return clients[k].models.generate_content(**kwargs)
         except Exception as e:
             msg = str(e)
             if is_key_error(msg):
-                # The key, not the model. Retrying the rest of the ladder with
-                # it reaches the same wall once per rung, so stop here and let
-                # the caller's default stand. Reported rather than silent: this
-                # is the one failure the user has to act on themselves.
-                _mark_key_dead(resolved_key, "the API rejected it")
-                print(f"[Gemini] key {key_label(resolved_key)} was rejected — "
-                      f"the feature behind this call is unavailable until a "
-                      f"valid key is configured")
-                return None
-            if is_quota_error(msg):
-                _cool(model)
-                print(f"[Gemini] {model}: out of quota — skipping it for "
-                      f"{_COOLDOWN_SECONDS // 60} minutes")
+                # The key, not the model: drop it for every model, next key.
+                _mark_key_dead(k, "the API rejected it")
+            elif is_quota_error(msg):
+                # This key's quota. Rest the pair; next iteration is the same
+                # model on the next key.
+                _cool(model, _COOLDOWN_SECONDS, k)
+                print(f"[Gemini] {model} @ {key_label(k)}: out of quota — "
+                      f"rotating, resting the pair {_COOLDOWN_SECONDS // 60} min")
             elif is_gone_error(msg):
                 _cool(model, _GONE_SECONDS)
                 print(f"[Gemini] {model}: unavailable to this key — set aside")
@@ -648,18 +673,50 @@ def call(contents, tier: str = FAST, config=None,
                       f"{_UNAVAILABLE_SECONDS // 60} minutes")
             else:
                 print(f"[Gemini] {model}: {type(e).__name__}: {msg[:140]}")
-    return None
+
+    # Every Gemini (model, key) failed. Fall back to Groq / OpenRouter — except
+    # for grounded search, which they cannot do honestly.
+    has_tools = config.get("tools") if isinstance(config, dict) else getattr(config, "tools", None)
+    if tier == SEARCH or has_tools:
+        return None
+    try:
+        try:
+            from . import model_router
+        except ImportError:                    # imported as a top-level module
+            import model_router
+        out = model_router.fallback_text(contents, config, _raw_config(),
+                                         timeout_s=max(10.0, timeout_ms / 1000.0))
+    except Exception as e:                                # noqa: BLE001
+        print(f"[Router] fallback failed: {type(e).__name__}: {str(e)[:140]}")
+        return None
+    return _Reply(out) if out else None
 
 
 def text(contents, tier: str = FAST, config=None,
          timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = "", default: str = "") -> str:
-    """`call`, reduced to the reply text. `default` when nothing answered."""
-    resp = call(contents, tier=tier, config=config,
-                timeout_ms=timeout_ms, key=key)
+    prompt = str(contents) if isinstance(contents, str) else getattr(contents, "text", str(contents))
+    p_lower = prompt.lower()
+
+    # ১. কাজের কি-ওয়ার্ড শনাক্ত করা (কোডিং বা ভারী কাজ)
+    is_coding = any(k in p_lower for k in ("কোড", "code", "python", "script", "function", "bug", "program", "debug"))
+    is_work   = any(k in p_lower for k in ("ডক্স", "docs", "শিট", "sheet", "ফাইল", "file", "update", "excel", "csv", "summary", "summarize", "draft"))
+
+    # ২. যদি কোনো স্পেসিফিক কাজ (কোডিং/ফাইল/ডকুমেন্ট) দেওয়া হয় -> OpenRouter (Task Router)
+    if is_coding or is_work or tier == SMART:
+        task = "coding" if is_coding else "writing"
+        try:
+            from core import model_router
+            out = model_router.call(prompt=prompt, task=task)
+            if out:
+                return out
+        except Exception as e:
+            print(f"[Gemini.text] Task router failed, falling back to Gemini: {e}")
+
+    # ৩. সাধারণ কথাবার্তা ও প্রশ্নোত্তরের জন্য সরাসরি দ্রুতগতির Gemini Flash
+    resp = call(contents, tier=tier, config=config, timeout_ms=timeout_ms, key=key)
     if resp is None:
         return default
     return (getattr(resp, "text", None) or "").strip() or default
-
 
 def as_json(contents, tier: str = FAST, config=None,
             timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = "", default=None):
