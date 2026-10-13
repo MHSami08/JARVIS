@@ -1,0 +1,89 @@
+{
+  "identity": {
+    "preferred_language": {
+      "value": "English",
+      "updated": "2026-10-03"
+    },
+    "language": {
+      "value": "Bengali",
+      "updated": "2026-10-14"
+    },
+    "preferred_name": {
+      "value": "MH",
+      "updated": "2026-10-12"
+    }
+  },
+  "preferences": {
+    "ui_user_message_color": {
+      "value": "green",
+      "updated": "2026-10-03"
+    },
+    "plays_games": {
+      "value": "false",
+      "updated": "2026-10-10"
+    },
+    "favorite_music": {
+      "value": "Jundullah perfectly slowed",
+      "updated": "2026-10-11"
+    },
+    "language": {
+      "value": "American English",
+      "updated": "2026-10-12"
+    },
+    "preferred_accent": {
+      "value": "American English",
+      "updated": "2026-10-12"
+    },
+    "preferred_document_format": {
+      "value": "bold_headings_with_emoji_and_numbered_lists_standard_style",
+      "updated": "2026-10-12"
+    },
+    "accent": {
+      "value": "American English",
+      "updated": "2026-10-13"
+    },
+    "ui_message_color": {
+      "value": "green",
+      "updated": "2026-10-13"
+    }
+  },
+  "projects": {},
+  "relationships": {},
+  "wishes": {},
+  "notes": {
+    "preferred_accent": {
+      "value": "American English",
+      "updated": "2026-10-02"
+    },
+    "installed_projects": {
+      "value": "Jarvis Mark LV, Zim Code",
+      "updated": "2026-10-13"
+    }
+  },
+  "sessions": [
+    {
+      "date": "2026-10-14",
+      "summary": "The user inquired about their screen recording software's ability to capture the AI's interface, the AI's voice, and their own voice simultaneously. The AI confirmed that all elements should be recorded and suggested conducting a test.",
+      "language": "English"
+    },
+    {
+      "date": "2026-10-14",
+      "summary": "The user asked to navigate to specific tabs and web content, eventually showing the AI its own GitHub repository. The user indicated they wanted to review the codebase for bugs but paused the interaction to explain something to someone else.",
+      "language": "English"
+    },
+    {
+      "date": "2026-10-14",
+      "summary": "ব্যবহারকারী র‍্যামের ব্যবহার পরীক্ষা করেন এবং টেম্প ফাইল সরিয়ে ১.১ জিবি জায়গা ফাঁকা করেন। এরপর তিনি WhatsApp-এ রবিউল গাজীকে মেসেজ পাঠান, PowerShell-এ একটি কমান্ড পুনরায় রান করে প্যাকেজ ইনস্টল করেন এবং স্ক্রিন স্ক্যান করে তার সাফল্য নিশ্চিত করেন।",
+      "language": "Bengali"
+    }
+  ],
+  "profile": {},
+  "monitors": {
+    "ai_news": {
+      "topic": "AI news",
+      "added": "2026-10-03",
+      "last_check": "2026-10-13",
+      "last_hash": "5424d78ac6c9"
+    }
+  }
+}
