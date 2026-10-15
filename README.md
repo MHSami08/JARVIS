@@ -64,7 +64,7 @@
 | 🧑‍💻 **Git দিয়ে** | নিচের কমান্ড টার্মিনালে পেস্ট করুন |
 
 ```bash
-git clone https://github.com/FatihMakes/Mark-LV.git
+git clone https://github.com/MHSami08/JARVIS-MARK-LV.git
 cd Mark-LV
 ```
 
